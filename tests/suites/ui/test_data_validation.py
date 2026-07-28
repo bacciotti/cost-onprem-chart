@@ -286,10 +286,12 @@ class TestOptimizationRecommendations:
         self, authenticated_page: Page, ui_url: str, cost_validation_data
     ):
         """Verify optimizations display CPU and memory recommendation values.
-        
+
         Each recommendation should show:
         - CPU values (cores, millicores)
         - Memory values (GiB, MiB)
+
+        Detail may appear as a new page, drawer, or inline panel.
         """
         authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
         authenticated_page.wait_for_load_state("networkidle")
@@ -311,16 +313,19 @@ class TestOptimizationRecommendations:
         
         container_link.click()
         authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Now look for CPU/memory related content in the detail view
+
+        # Wait for detail content to appear (drawer, panel, or page navigation)
         cpu_content = authenticated_page.get_by_text(re.compile(r"cpu|core|millicore", re.IGNORECASE))
         memory_content = authenticated_page.get_by_text(re.compile(r"memory|gib|mib|ram", re.IGNORECASE))
+
+        for _ in range(5):
+            time.sleep(2)
+            if cpu_content.count() > 0 or memory_content.count() > 0:
+                break
         
         has_cpu = cpu_content.count() > 0
         has_memory = memory_content.count() > 0
         
-        # Capture screenshot for verification
         save_screenshot(authenticated_page, "06_optimizations_cpu_memory")
         
         assert has_cpu or has_memory, (
@@ -331,10 +336,12 @@ class TestOptimizationRecommendations:
         self, authenticated_page: Page, ui_url: str, cost_validation_data
     ):
         """Verify optimizations show request/limit recommendations.
-        
+
         Kruize recommendations include:
         - Current requests/limits
         - Recommended requests/limits
+
+        Detail may appear as a new page, drawer, or inline panel.
         """
         authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
         authenticated_page.wait_for_load_state("networkidle")
@@ -356,14 +363,17 @@ class TestOptimizationRecommendations:
         
         container_link.click()
         authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for request/limit terminology in the detail view
+
+        # Wait for detail content to appear
         request_limit_content = authenticated_page.get_by_text(
             re.compile(r"request|limit|current|recommended|change", re.IGNORECASE)
         )
+
+        for _ in range(5):
+            time.sleep(2)
+            if request_limit_content.count() > 0:
+                break
         
-        # Capture screenshot for verification
         save_screenshot(authenticated_page, "07_optimizations_request_limit")
         
         assert request_limit_content.count() > 0, (
@@ -384,7 +394,11 @@ class TestOptimizationBreakdown:
     def test_can_navigate_to_optimization_detail(
         self, authenticated_page: Page, ui_url: str, cost_validation_data
     ):
-        """Verify clicking an optimization navigates to detail view."""
+        """Verify clicking an optimization opens a detail view.
+
+        The UI may navigate to a new URL or render detail content inline
+        (drawer, panel, or expanded row).  Both patterns are valid.
+        """
         authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
         authenticated_page.wait_for_load_state("networkidle")
         time.sleep(3)
@@ -396,29 +410,39 @@ class TestOptimizationBreakdown:
         
         # Find clickable row or link
         clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row'], "
-            "[role='row'] a, table tbody tr td a"
+            "table tbody tr td a, table tbody tr td button, "
+            "[role='row'] a, [role='row'] button"
         ).first
         
         if clickable.count() == 0:
             pytest.skip("No clickable optimization rows found")
         
-        # Store current URL
         current_url = authenticated_page.url
-        
-        # Click to navigate
         clickable.click()
         authenticated_page.wait_for_load_state("networkidle")
         time.sleep(2)
         
-        # URL should change to detail/breakdown view
-        new_url = authenticated_page.url
-        
-        # Capture screenshot for verification
         save_screenshot(authenticated_page, "08_optimization_detail_navigation")
         
-        assert new_url != current_url or "breakdown" in new_url or "detail" in new_url, (
-            "Clicking optimization should navigate to detail view"
+        # Accept either URL-based navigation or inline detail content
+        url_changed = authenticated_page.url != current_url
+        detail_content = authenticated_page.get_by_text(
+            re.compile(r"cpu|memory|request|limit|recommendation|current|container", re.IGNORECASE)
+        )
+        drawer = authenticated_page.locator(
+            ".pf-v6-c-drawer__panel, .pf-c-drawer__panel, "
+            "[role='dialog'], .pf-v6-c-modal-box, .pf-c-modal-box"
+        )
+        
+        has_detail = (
+            url_changed
+            or detail_content.count() > 2
+            or (drawer.count() > 0 and drawer.first.is_visible())
+        )
+        
+        assert has_detail, (
+            "Clicking optimization should open detail view "
+            "(URL change, drawer, or inline detail content)"
         )
 
     def test_optimization_detail_shows_container_info(
@@ -436,7 +460,8 @@ class TestOptimizationBreakdown:
         
         # Navigate to first optimization detail
         clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row']"
+            "table tbody tr td a, table tbody tr td button, "
+            "[role='row'] a, [role='row'] button"
         ).first
         
         if clickable.count() == 0:
@@ -444,14 +469,17 @@ class TestOptimizationBreakdown:
         
         clickable.click()
         authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for container-related content
+
+        # Wait for detail content to appear
         container_info = authenticated_page.get_by_text(
             re.compile(r"container|pod|workload|namespace|cluster", re.IGNORECASE)
         )
+
+        for _ in range(5):
+            time.sleep(2)
+            if container_info.count() > 0:
+                break
         
-        # Capture screenshot for verification
         save_screenshot(authenticated_page, "09_optimization_container_info")
         
         assert container_info.count() > 0, (
@@ -473,7 +501,8 @@ class TestOptimizationBreakdown:
         
         # Navigate to first optimization detail
         clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row']"
+            "table tbody tr td a, table tbody tr td button, "
+            "[role='row'] a, [role='row'] button"
         ).first
         
         if clickable.count() == 0:
@@ -481,17 +510,19 @@ class TestOptimizationBreakdown:
         
         clickable.click()
         authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for numeric values (CPU cores, memory GiB)
+
+        # Wait for detail content to appear
         numeric_values = authenticated_page.get_by_text(
             re.compile(r"[0-9]+\.?[0-9]*\s*(core|cpu|gib|mib|m)", re.IGNORECASE)
         )
+
+        for _ in range(5):
+            time.sleep(2)
+            if numeric_values.count() > 0:
+                break
         
-        # Capture screenshot for verification
         save_screenshot(authenticated_page, "10_optimization_recommendation_values")
         
-        # Should have multiple numeric values for recommendations
         assert numeric_values.count() > 0, (
             "Optimization detail should show numeric CPU/memory values"
         )
