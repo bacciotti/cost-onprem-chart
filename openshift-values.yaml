@@ -92,6 +92,11 @@ jwtAuth:
     # namespace: "keycloak"  # Defaults to "keycloak" when empty
     # serviceName: "keycloak-service"  # Defaults to "keycloak-service" when empty
 
+# Currency exchange rate configuration for testing
+# Production on-prem does not use dynamic rates (no outbound dependency)
+costManagement:
+  currencyUrl: "https://open.er-api.com/v6/latest/USD"
+
 # OpenShift Routes configuration
 # Override: longer timeout (300s vs 30s default) for large file uploads
 gatewayRoute:

@@ -130,6 +130,15 @@ costManagement:
   reportDownloadSchedule: "*/5 * * * *"
 
   # ---------------------------------------------------------------------------
+  # Currency Configuration
+  # ---------------------------------------------------------------------------
+  # External exchange rate API URL for the celery cron job.
+  # Not set by default for on-prem (no outbound dependency). Set this in
+  # test/CI environments to enable dynamic exchange rate fetching.
+  # Example: "https://open.er-api.com/v6/latest/USD"
+  currencyUrl: ""
+
+  # ---------------------------------------------------------------------------
   # S3 Configuration
   # ---------------------------------------------------------------------------
   s3VerifySSL: false
