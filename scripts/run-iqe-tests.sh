@@ -661,58 +661,9 @@ else
     echo "WARNING: Could not extract cluster CA certificates"
 fi
 
-# Enable currencies in the EnabledCurrency table (required by koku COST-7252+).
-# Fresh deployments have an empty EnabledCurrency table, which causes the
-# /exchange-rates/ API to 404 and currency-filtered tests to fail.
-echo ""
-echo "Enabling currencies via Django ORM..."
-ENABLE_CURRENCY_OUTPUT=$(kubectl exec --request-timeout=60s -n "${NAMESPACE}" deploy/${HELM_RELEASE_NAME}-koku-api -c koku-api -- \
-    python -c "
-import os, sys
-os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'koku.settings')
-import django
-django.setup()
-
-try:
-    from cost_models.models import EnabledCurrency
-except ImportError:
-    print('EnabledCurrency model not found (pre-COST-7252 image), skipping')
-    sys.exit(0)
-
-from django_tenants.utils import schema_context
-from api.iam.models import Tenant
-
-CURRENCIES = [
-    'USD', 'EUR', 'GBP', 'CAD', 'AUD', 'JPY', 'CHF', 'CNY', 'INR', 'BRL',
-    'ZAR', 'DKK', 'NOK', 'SEK', 'CZK', 'MXN', 'GHS', 'NGN', 'KES', 'PHP',
-    'SGD', 'NZD',
-]
-
-tenants = Tenant.objects.exclude(schema_name='public').exclude(schema_name__startswith='template')
-if not tenants.exists():
-    print('No tenant schemas found, skipping currency enablement')
-    sys.exit(0)
-
-enabled_total = 0
-for tenant in tenants:
-    try:
-        with schema_context(tenant.schema_name):
-            for code in CURRENCIES:
-                _, created = EnabledCurrency.objects.get_or_create(currency_code=code)
-                if created:
-                    enabled_total += 1
-    except Exception as e:
-        print(f'WARNING: {tenant.schema_name}: {e}', file=sys.stderr)
-
-print(f'Enabled currencies across {tenants.count()} tenant(s) ({enabled_total} new entries)')
-" 2>&1 || echo "FAILED")
-if [[ "$ENABLE_CURRENCY_OUTPUT" == "FAILED" ]]; then
-    echo "⚠ WARNING: Could not enable currencies. Currency-filtered tests may fail."
-else
-    echo "✓ ${ENABLE_CURRENCY_OUTPUT}"
-fi
-
 # Pre-seed exchange rates so currency-filtered tests have valid rates available.
+# The EnabledCurrency table is populated by koku migration 0014_enabled_currency;
+# CURRENCY_URL must be set (via Helm value) for update_exchange_rates to fetch rates.
 # The get_daily_currency_rates Celery task runs on a schedule and may not have
 # executed yet on fresh/ephemeral deployments.
 echo ""

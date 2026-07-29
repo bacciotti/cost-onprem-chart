@@ -296,29 +296,29 @@ class TestOptimizationRecommendations:
         authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
         authenticated_page.wait_for_load_state("networkidle")
         time.sleep(3)
-        
+
         # Check for empty state
         empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
         if empty_state.count() > 0 and empty_state.first.is_visible():
             pytest.skip("No optimization data available yet")
-        
+
         # Click on a container name in the table to see CPU/memory details
         container_link = authenticated_page.locator(
             "table tbody tr td a, table tbody tr td button, "
             "[role='row'] a, [role='row'] button"
         ).first
-        
+
         if container_link.count() == 0:
             pytest.skip("No clickable container names found in optimizations table")
-        
+
         container_link.click()
         authenticated_page.wait_for_load_state("networkidle")
 
-        # Wait for detail content to appear (drawer, panel, or page navigation)
+        # Wait for detail content to appear (async bundle load + render)
         cpu_content = authenticated_page.get_by_text(re.compile(r"cpu|core|millicore", re.IGNORECASE))
         memory_content = authenticated_page.get_by_text(re.compile(r"memory|gib|mib|ram", re.IGNORECASE))
 
-        for _ in range(5):
+        for _ in range(8):
             time.sleep(2)
             if cpu_content.count() > 0 or memory_content.count() > 0:
                 break
@@ -364,12 +364,12 @@ class TestOptimizationRecommendations:
         container_link.click()
         authenticated_page.wait_for_load_state("networkidle")
 
-        # Wait for detail content to appear
+        # Wait for detail content to appear (async bundle load + render)
         request_limit_content = authenticated_page.get_by_text(
             re.compile(r"request|limit|current|recommended|change", re.IGNORECASE)
         )
 
-        for _ in range(5):
+        for _ in range(8):
             time.sleep(2)
             if request_limit_content.count() > 0:
                 break
@@ -420,12 +420,9 @@ class TestOptimizationBreakdown:
         current_url = authenticated_page.url
         clickable.click()
         authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        save_screenshot(authenticated_page, "08_optimization_detail_navigation")
-        
-        # Accept either URL-based navigation or inline detail content
-        url_changed = authenticated_page.url != current_url
+
+        # The detail bundle loads asynchronously after the click; wait for
+        # it to render content indicating the detail view appeared.
         detail_content = authenticated_page.get_by_text(
             re.compile(r"cpu|memory|request|limit|recommendation|current|container", re.IGNORECASE)
         )
@@ -433,16 +430,29 @@ class TestOptimizationBreakdown:
             ".pf-v6-c-drawer__panel, .pf-c-drawer__panel, "
             "[role='dialog'], .pf-v6-c-modal-box, .pf-c-modal-box"
         )
-        
-        has_detail = (
-            url_changed
-            or detail_content.count() > 2
-            or (drawer.count() > 0 and drawer.first.is_visible())
+        expandable = authenticated_page.locator(
+            ".pf-v6-c-table__expandable-row, .pf-c-table__expandable-row, "
+            "[aria-expanded='true'], .pf-m-expanded"
         )
+
+        has_detail = False
+        for _ in range(8):
+            time.sleep(2)
+            url_changed = authenticated_page.url != current_url
+            has_detail = (
+                url_changed
+                or detail_content.count() > 2
+                or (drawer.count() > 0 and drawer.first.is_visible())
+                or (expandable.count() > 0 and expandable.first.is_visible())
+            )
+            if has_detail:
+                break
+
+        save_screenshot(authenticated_page, "08_optimization_detail_navigation")
         
         assert has_detail, (
             "Clicking optimization should open detail view "
-            "(URL change, drawer, or inline detail content)"
+            "(URL change, drawer, expandable row, or inline detail content)"
         )
 
     def test_optimization_detail_shows_container_info(
