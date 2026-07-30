@@ -378,6 +378,10 @@ Common environment variables for Koku API and Celery
   value: {{ .Values.costManagement.reportDownloadSchedule | default "*/5 * * * *" | quote }}
 - name: POLLING_TIMER
   value: {{ .Values.costManagement.celery.pollingTimer | default "86400" | quote }}
+{{- if .Values.costManagement.currencyUrl }}
+- name: CURRENCY_URL
+  value: {{ .Values.costManagement.currencyUrl | quote }}
+{{- end }}
 # RBAC v1 authorization backend connection
 - name: RBAC_SERVICE_HOST
   value: {{ include "cost-onprem.rbac.serviceHost" . | quote }}

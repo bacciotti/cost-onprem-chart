@@ -662,6 +662,8 @@ else
 fi
 
 # Pre-seed exchange rates so currency-filtered tests have valid rates available.
+# The EnabledCurrency table is populated by koku migration 0014_enabled_currency;
+# CURRENCY_URL must be set (via Helm value) for update_exchange_rates to fetch rates.
 # The get_daily_currency_rates Celery task runs on a schedule and may not have
 # executed yet on fresh/ephemeral deployments.
 echo ""

@@ -14,7 +14,7 @@ import re
 import time
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page
 
 
 def save_screenshot(page: Page, name: str) -> str:
@@ -232,266 +232,41 @@ class TestCostDataVisualization:
 @pytest.mark.ui
 @pytest.mark.ros
 @pytest.mark.data_validation
-class TestOptimizationRecommendations:
-    """Test that optimization recommendations display correctly.
-    
-    HIGH PRIORITY: Validates CPU/memory recommendations from Kruize are shown.
-    Uses cost_validation_data fixture for self-contained data setup.
-    
-    Note: Optimization recommendations require Kruize processing time after data upload.
-    The E2E flow waits for recommendations to be generated before these tests run.
+class TestOptimizationsPipeline:
+    """Validate the full optimizations pipeline: upload → processing → UI display.
+
+    Uses cost_validation_data fixture to upload test data, then verifies that
+    the optimizations page renders a table with recommendation entries.
+
+    API-level recommendation validation (filters, pagination, response
+    structure, CPU/memory fields) is covered by suites/ros/test_recommendations.py.
+    Basic page-load and empty-state UI tests are in test_optimizations.py.
     """
 
-    def test_optimizations_table_has_recommendations(
+    def test_optimizations_table_populated_after_upload(
         self, authenticated_page: Page, ui_url: str, cost_validation_data
     ):
-        """Verify optimizations page displays recommendation data.
-        
-        Should show:
-        - Table with container/workload recommendations
-        - CPU and memory columns
-        - Actual values (not all zeros or empty)
+        """Verify optimizations table displays data after test upload completes.
+
+        This is the pipeline integration check: data was uploaded and processed
+        (via cost_validation_data fixture), so the optimizations page should
+        show a non-empty table.
         """
         authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
         authenticated_page.wait_for_load_state("networkidle")
-        
-        # Wait for data to load
         time.sleep(3)
-        
-        # Check for empty state
+
         empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        empty_text = authenticated_page.get_by_text(re.compile(r"no optimization|no recommendation", re.IGNORECASE))
-        
-        # Optimization data may take longer to process - check if available
-        if (empty_state.count() > 0 and empty_state.first.is_visible()) or \
-           (empty_text.count() > 0 and empty_text.first.is_visible()):
-            # This is acceptable - Kruize may not have processed yet
-            pytest.skip(
-                "No optimization data available yet. "
-                "Kruize may still be processing recommendations."
-            )
-        
-        # Look for table with data
+        if empty_state.count() > 0 and empty_state.first.is_visible():
+            pytest.skip("No optimization data available yet — Kruize may still be processing")
+
         table = authenticated_page.locator("table, [role='grid'], .pf-v6-c-table")
-        expect(table.first).to_be_visible(timeout=10000)
-        
-        # Capture screenshot for verification
+        assert table.count() > 0, "Optimizations table should be present"
+
+        rows = authenticated_page.locator("table tbody tr")
+        assert rows.count() > 0, "Optimizations table should have at least one row"
+
+        headers = authenticated_page.locator("table thead th, table th")
+        assert headers.count() > 0, "Table should have column headers"
+
         save_screenshot(authenticated_page, "05_optimizations_table")
-        
-        # Verify table has rows
-        rows = authenticated_page.locator("table tbody tr, [role='row']")
-        assert rows.count() > 0, "Optimizations table should have recommendation rows"
-
-    def test_optimizations_show_cpu_memory_values(
-        self, authenticated_page: Page, ui_url: str, cost_validation_data
-    ):
-        """Verify optimizations display CPU and memory recommendation values.
-        
-        Each recommendation should show:
-        - CPU values (cores, millicores)
-        - Memory values (GiB, MiB)
-        """
-        authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        
-        # Check for empty state
-        empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        if empty_state.count() > 0 and empty_state.first.is_visible():
-            pytest.skip("No optimization data available yet")
-        
-        # Click on a container name in the table to see CPU/memory details
-        container_link = authenticated_page.locator(
-            "table tbody tr td a, table tbody tr td button, "
-            "[role='row'] a, [role='row'] button"
-        ).first
-        
-        if container_link.count() == 0:
-            pytest.skip("No clickable container names found in optimizations table")
-        
-        container_link.click()
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Now look for CPU/memory related content in the detail view
-        cpu_content = authenticated_page.get_by_text(re.compile(r"cpu|core|millicore", re.IGNORECASE))
-        memory_content = authenticated_page.get_by_text(re.compile(r"memory|gib|mib|ram", re.IGNORECASE))
-        
-        has_cpu = cpu_content.count() > 0
-        has_memory = memory_content.count() > 0
-        
-        # Capture screenshot for verification
-        save_screenshot(authenticated_page, "06_optimizations_cpu_memory")
-        
-        assert has_cpu or has_memory, (
-            "Optimization detail should display CPU and/or memory recommendation values"
-        )
-
-    def test_optimizations_show_request_limit_recommendations(
-        self, authenticated_page: Page, ui_url: str, cost_validation_data
-    ):
-        """Verify optimizations show request/limit recommendations.
-        
-        Kruize recommendations include:
-        - Current requests/limits
-        - Recommended requests/limits
-        """
-        authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        
-        # Check for empty state
-        empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        if empty_state.count() > 0 and empty_state.first.is_visible():
-            pytest.skip("No optimization data available yet")
-        
-        # Click on a container name to see request/limit details
-        container_link = authenticated_page.locator(
-            "table tbody tr td a, table tbody tr td button, "
-            "[role='row'] a, [role='row'] button"
-        ).first
-        
-        if container_link.count() == 0:
-            pytest.skip("No clickable container names found in optimizations table")
-        
-        container_link.click()
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for request/limit terminology in the detail view
-        request_limit_content = authenticated_page.get_by_text(
-            re.compile(r"request|limit|current|recommended|change", re.IGNORECASE)
-        )
-        
-        # Capture screenshot for verification
-        save_screenshot(authenticated_page, "07_optimizations_request_limit")
-        
-        assert request_limit_content.count() > 0, (
-            "Optimization detail should show request/limit recommendations"
-        )
-
-
-@pytest.mark.ui
-@pytest.mark.ros
-@pytest.mark.data_validation
-class TestOptimizationBreakdown:
-    """Test optimization detail/breakdown views.
-    
-    Validates detailed breakdown view shows correct data.
-    Uses cost_validation_data fixture for self-contained data setup.
-    """
-
-    def test_can_navigate_to_optimization_detail(
-        self, authenticated_page: Page, ui_url: str, cost_validation_data
-    ):
-        """Verify clicking an optimization navigates to detail view."""
-        authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        
-        # Check for empty state
-        empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        if empty_state.count() > 0 and empty_state.first.is_visible():
-            pytest.skip("No optimization data available yet")
-        
-        # Find clickable row or link
-        clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row'], "
-            "[role='row'] a, table tbody tr td a"
-        ).first
-        
-        if clickable.count() == 0:
-            pytest.skip("No clickable optimization rows found")
-        
-        # Store current URL
-        current_url = authenticated_page.url
-        
-        # Click to navigate
-        clickable.click()
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # URL should change to detail/breakdown view
-        new_url = authenticated_page.url
-        
-        # Capture screenshot for verification
-        save_screenshot(authenticated_page, "08_optimization_detail_navigation")
-        
-        assert new_url != current_url or "breakdown" in new_url or "detail" in new_url, (
-            "Clicking optimization should navigate to detail view"
-        )
-
-    def test_optimization_detail_shows_container_info(
-        self, authenticated_page: Page, ui_url: str, cost_validation_data
-    ):
-        """Verify optimization detail shows container-level information."""
-        authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        
-        # Check for empty state
-        empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        if empty_state.count() > 0 and empty_state.first.is_visible():
-            pytest.skip("No optimization data available yet")
-        
-        # Navigate to first optimization detail
-        clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row']"
-        ).first
-        
-        if clickable.count() == 0:
-            pytest.skip("No clickable optimization rows found")
-        
-        clickable.click()
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for container-related content
-        container_info = authenticated_page.get_by_text(
-            re.compile(r"container|pod|workload|namespace|cluster", re.IGNORECASE)
-        )
-        
-        # Capture screenshot for verification
-        save_screenshot(authenticated_page, "09_optimization_container_info")
-        
-        assert container_info.count() > 0, (
-            "Optimization detail should show container/workload information"
-        )
-
-    def test_optimization_detail_shows_recommendation_values(
-        self, authenticated_page: Page, ui_url: str, cost_validation_data
-    ):
-        """Verify optimization detail shows specific recommendation values."""
-        authenticated_page.goto(f"{ui_url}/openshift/cost-management/optimizations")
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(3)
-        
-        # Check for empty state
-        empty_state = authenticated_page.locator(".pf-v6-c-empty-state, .pf-c-empty-state")
-        if empty_state.count() > 0 and empty_state.first.is_visible():
-            pytest.skip("No optimization data available yet")
-        
-        # Navigate to first optimization detail
-        clickable = authenticated_page.locator(
-            "table tbody tr a, table tbody tr[role='row']"
-        ).first
-        
-        if clickable.count() == 0:
-            pytest.skip("No clickable optimization rows found")
-        
-        clickable.click()
-        authenticated_page.wait_for_load_state("networkidle")
-        time.sleep(2)
-        
-        # Look for numeric values (CPU cores, memory GiB)
-        numeric_values = authenticated_page.get_by_text(
-            re.compile(r"[0-9]+\.?[0-9]*\s*(core|cpu|gib|mib|m)", re.IGNORECASE)
-        )
-        
-        # Capture screenshot for verification
-        save_screenshot(authenticated_page, "10_optimization_recommendation_values")
-        
-        # Should have multiple numeric values for recommendations
-        assert numeric_values.count() > 0, (
-            "Optimization detail should show numeric CPU/memory values"
-        )
