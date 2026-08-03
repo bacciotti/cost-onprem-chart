@@ -20,7 +20,6 @@ Usage:
     PERF_PROFILE=medium pytest -m "performance and rbac_perf" tests/suites/performance/
 """
 
-import statistics
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,12 +29,7 @@ from typing import Any, Dict, List, Optional
 import pytest
 import requests as _requests
 
-from conftest import (
-    ClusterConfig,
-    DatabaseConfig,
-    KeycloakConfig,
-    obtain_password_grant_token,
-)
+from conftest import ClusterConfig, DatabaseConfig
 from utils import exec_in_pod, get_pod_by_label, run_oc_command
 
 from .data_classes import PerformanceResult
@@ -52,25 +46,15 @@ from .k8s_helpers import calculate_percentiles, capture_pg_stats, diff_pg_stats
 # =============================================================================
 
 
-def _get_rbac_direct_url(helm_release: str, namespace: str) -> str:
-    """Build the in-cluster RBAC API URL (bypasses Envoy)."""
-    return f"http://{helm_release}-rbac-api.{namespace}.svc.cluster.local:8000"
+def _rbac_access_url(gateway_url: str) -> str:
+    """RBAC permission check endpoint via the Envoy gateway.
 
-
-def _rbac_access_url(rbac_url: str) -> str:
-    """The RBAC permission check endpoint Koku calls on every request."""
-    return f"{rbac_url}/api/rbac/v1/access/?application=cost-management"
-
-
-def _rbac_status_url(rbac_url: str) -> str:
-    return f"{rbac_url}/api/rbac/v1/status/"
-
-
-def _make_rbac_headers(session: _requests.Session) -> Dict[str, str]:
-    """Extract auth headers from a pre-authenticated session."""
-    headers = dict(session.headers)
-    headers.setdefault("Accept", "application/json")
-    return headers
+    Tests run outside the cluster (Jenkins hypervisor), so ClusterIP
+    service DNS is not resolvable. The gateway routes ``/api/rbac/``
+    to the RBAC backend, giving us an externally reachable path that
+    still isolates RBAC latency from the Koku API path.
+    """
+    return f"{gateway_url.rstrip('/')}/api/rbac/v1/access/?application=cost-management"
 
 
 def _flush_rbac_cache(namespace: str) -> int:
@@ -81,7 +65,7 @@ def _flush_rbac_cache(namespace: str) -> int:
 
     result = exec_in_pod(
         namespace, pod,
-        ["redis-cli", "EVAL",
+        ["valkey-cli", "EVAL",
          "local keys = redis.call('KEYS', 'rbac:*'); "
          "if #keys > 0 then return redis.call('DEL', unpack(keys)) "
          "else return 0 end",
@@ -104,7 +88,7 @@ def _count_rbac_cache_keys(namespace: str) -> int:
 
     result = exec_in_pod(
         namespace, pod,
-        ["redis-cli", "EVAL",
+        ["valkey-cli", "EVAL",
          "return #redis.call('KEYS', 'rbac:*')", "0"],
         timeout=15,
     )
@@ -207,7 +191,6 @@ class TestRBACPerf:
     def setup(self, cluster_config: ClusterConfig, keycloak_config):
         self.namespace = cluster_config.namespace
         self.helm_release = cluster_config.helm_release_name
-        self.rbac_url = _get_rbac_direct_url(self.helm_release, self.namespace)
         self._keycloak_config = keycloak_config
         self._cluster_config = cluster_config
 
@@ -240,7 +223,7 @@ class TestRBACPerf:
         print(f"{'='*72}\n")
 
         session = self._create_session()
-        rbac_access = _rbac_access_url(self.rbac_url)
+        rbac_access = _rbac_access_url(gateway_url)
         koku_reports = f"{gateway_url.rstrip('/')}/api/cost-management/v1/reports/openshift/costs/"
 
         # Warm up: a few requests to prime caches
@@ -310,6 +293,7 @@ class TestRBACPerf:
     def test_perf_rbac_002_cache_effectiveness(
         self,
         cluster_config: ClusterConfig,
+        gateway_url: str,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
         perf_collector: PerfResultCollector,
@@ -326,7 +310,7 @@ class TestRBACPerf:
         print(f"{'='*72}\n")
 
         session = self._create_session()
-        rbac_access = _rbac_access_url(self.rbac_url)
+        rbac_access = _rbac_access_url(gateway_url)
 
         # Flush RBAC cache
         deleted = _flush_rbac_cache(self.namespace)
@@ -387,6 +371,7 @@ class TestRBACPerf:
         concurrency: int,
         cluster_config: ClusterConfig,
         database_config: DatabaseConfig,
+        gateway_url: str,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
         perf_collector: PerfResultCollector,
@@ -402,7 +387,7 @@ class TestRBACPerf:
         print(f"PERF-RBAC-003: Concurrent Auth Load (concurrency={concurrency})")
         print(f"{'='*72}\n")
 
-        rbac_access = _rbac_access_url(self.rbac_url)
+        rbac_access = _rbac_access_url(gateway_url)
 
         pg_before = capture_pg_stats(
             self.namespace,
@@ -475,6 +460,7 @@ class TestRBACPerf:
         org_count: int,
         cluster_config: ClusterConfig,
         database_config: DatabaseConfig,
+        gateway_url: str,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
         perf_collector: PerfResultCollector,
@@ -500,17 +486,17 @@ class TestRBACPerf:
             pytest.skip("Database pod not found")
 
         from utils import execute_db_query
-        tenant_result = execute_db_query(
+        tenant_rows = execute_db_query(
             self.namespace, db_pod,
+            "costonprem_rbac",
+            database_config.user,
             "SELECT count(*) FROM api_tenant;",
-            db_name="costonprem_rbac",
-            db_user=database_config.user,
         )
         current_tenants = 0
-        if tenant_result:
+        if tenant_rows and tenant_rows[0]:
             try:
-                current_tenants = int(tenant_result.strip())
-            except ValueError:
+                current_tenants = int(tenant_rows[0][0])
+            except (ValueError, IndexError):
                 pass
 
         print(f"Current tenant count in RBAC DB: {current_tenants}")
@@ -522,7 +508,7 @@ class TestRBACPerf:
             )
 
         session = self._create_session()
-        rbac_access = _rbac_access_url(self.rbac_url)
+        rbac_access = _rbac_access_url(gateway_url)
 
         # Measure RBAC latency at current org count
         print(f"Measuring RBAC latency with {current_tenants} tenants (100 calls)...")
@@ -534,14 +520,14 @@ class TestRBACPerf:
         for table in ["api_tenant", "api_principal", "api_group", "api_policy", "api_role"]:
             size_result = execute_db_query(
                 self.namespace, db_pod,
+                "costonprem_rbac",
+                database_config.user,
                 f"SELECT count(*) FROM {table};",
-                db_name="costonprem_rbac",
-                db_user=database_config.user,
             )
-            if size_result:
+            if size_result and size_result[0]:
                 try:
-                    table_sizes[table] = int(size_result.strip())
-                except ValueError:
+                    table_sizes[table] = int(size_result[0][0])
+                except (ValueError, IndexError):
                     pass
 
         print(f"\n{'='*72}")
