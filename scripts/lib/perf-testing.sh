@@ -404,6 +404,7 @@ run_performance_tests() {
                 stress)    perf_args+=("--perf-stress") ;;
                 stress_ramp)    perf_args+=("--perf-stress-ramp") ;;
                 stress_recovery) perf_args+=("--perf-stress-recovery") ;;
+                rbac)    perf_args+=("--perf-rbac") ;;
             esac
         done
     fi
