@@ -11,6 +11,8 @@ Test IDs:
 - PERF-RBAC-002: Cache effectiveness (cold vs warm)
 - PERF-RBAC-003: Concurrent authorization load (parametrized)
 - PERF-RBAC-004: Multi-org scaling (parametrized, conditional)
+- PERF-RBAC-005: Replica scaling (1→2→3 replicas under load)
+- PERF-RBAC-006: RBAC latency under ingestion load
 
 Usage:
     # All RBAC perf tests
@@ -37,8 +39,16 @@ from .helpers import (
     PerfResultCollector,
     PerfTimer,
     create_authenticated_session,
+    generate_and_upload_data,
+    register_tracked_source,
 )
-from .k8s_helpers import calculate_percentiles, capture_pg_stats, diff_pg_stats
+from .k8s_helpers import (
+    calculate_percentiles,
+    capture_pg_stats,
+    diff_pg_stats,
+    get_deployment_replicas,
+    scale_deployment,
+)
 
 
 # =============================================================================
@@ -556,6 +566,263 @@ class TestRBACPerf:
             "actual_tenants": current_tenants,
             "latency": stats,
             "table_sizes": table_sizes,
+        }
+        perf_result.passed = True
+        perf_collector.add_result(perf_result)
+
+    # -----------------------------------------------------------------
+    # RBAC-005: Replica scaling
+    # -----------------------------------------------------------------
+
+    @pytest.mark.timeout(900)
+    def test_perf_rbac_005_replica_scaling(
+        self,
+        cluster_config: ClusterConfig,
+        gateway_url: str,
+        perf_timer: PerfTimer,
+        perf_result: PerformanceResult,
+        perf_collector: PerfResultCollector,
+        keycloak_config,
+    ):
+        """PERF-RBAC-005: Determine if scaling RBAC replicas improves throughput.
+
+        Runs concurrent load (concurrency=20) at 1, 2, and 3 RBAC API replicas.
+        Compares p95 latencies and throughput to determine scaling linearity.
+        Restores original replica count on completion.
+        """
+        print(f"\n{'='*72}")
+        print("PERF-RBAC-005: RBAC Replica Scaling")
+        print(f"{'='*72}\n")
+
+        rbac_deploy = f"{self.helm_release}-rbac-api"
+        original_replicas = get_deployment_replicas(self.namespace, rbac_deploy)
+        print(f"Original RBAC replica count: {original_replicas}")
+
+        rbac_access = _rbac_access_url(gateway_url)
+        concurrency = 20
+        duration = 60.0
+        results_by_replicas = {}
+
+        try:
+            for replica_count in [1, 2, 3]:
+                print(f"\n--- Scaling RBAC to {replica_count} replica(s) ---")
+                if not scale_deployment(self.namespace, rbac_deploy, replica_count):
+                    print(f"  WARN: Failed to scale to {replica_count}, skipping")
+                    continue
+
+                time.sleep(5)
+
+                print(f"  Running concurrent load (concurrency={concurrency}, "
+                      f"duration={duration}s)...")
+                stats = _measure_latency_concurrent(
+                    session_factory=self._create_session,
+                    url=rbac_access,
+                    concurrency=concurrency,
+                    duration_s=duration,
+                )
+
+                rbac_pod = get_pod_by_label(
+                    self.namespace, "app.kubernetes.io/component=rbac-api"
+                )
+                pod_metrics = {}
+                if rbac_pod:
+                    result = run_oc_command(
+                        ["adm", "top", "pod", rbac_pod,
+                         "-n", self.namespace, "--no-headers"],
+                        check=False,
+                    )
+                    if result.returncode == 0 and result.stdout.strip():
+                        parts = result.stdout.strip().split()
+                        if len(parts) >= 3:
+                            pod_metrics = {"cpu": parts[1], "memory": parts[2]}
+
+                results_by_replicas[replica_count] = {
+                    "latency": stats,
+                    "pod_metrics": pod_metrics,
+                }
+
+                print(f"  {replica_count} replica(s): "
+                      f"{stats['total_requests']} reqs, "
+                      f"{stats['requests_per_second']} req/s, "
+                      f"p50={stats['p50']*1000:.1f}ms, "
+                      f"p95={stats['p95']*1000:.1f}ms, "
+                      f"errors={stats.get('errors', 0)}")
+        finally:
+            print(f"\nRestoring RBAC to {original_replicas} replica(s)...")
+            scale_deployment(self.namespace, rbac_deploy, original_replicas)
+
+        print(f"\n{'='*72}")
+        print("RBAC-005 SUMMARY: Replica Scaling")
+        print(f"{'='*72}")
+
+        baseline_p95 = None
+        for rc, data in sorted(results_by_replicas.items()):
+            lat = data["latency"]
+            p95 = lat["p95"] * 1000
+            improvement = ""
+            if baseline_p95 is not None and baseline_p95 > 0:
+                pct = (1 - p95 / baseline_p95) * 100
+                improvement = f" ({pct:+.0f}% vs 1-replica)"
+            else:
+                baseline_p95 = p95
+            print(f"  {rc} replica(s): p95={p95:.1f}ms, "
+                  f"{lat['requests_per_second']} req/s{improvement}")
+
+        perf_result.test_id = "PERF-RBAC-005"
+        perf_result.metrics = {
+            "concurrency": concurrency,
+            "results_by_replicas": results_by_replicas,
+        }
+        perf_result.passed = True
+        perf_collector.add_result(perf_result)
+
+    # -----------------------------------------------------------------
+    # RBAC-006: Under ingestion load
+    # -----------------------------------------------------------------
+
+    @pytest.mark.timeout(600)
+    def test_perf_rbac_006_under_ingestion(
+        self,
+        cluster_config: ClusterConfig,
+        database_config: DatabaseConfig,
+        gateway_url: str,
+        perf_timer: PerfTimer,
+        perf_result: PerformanceResult,
+        perf_collector: PerfResultCollector,
+        perf_cleanup,
+        keycloak_config,
+    ):
+        """PERF-RBAC-006: Measure RBAC latency while ingestion is active.
+
+        Captures quiescent RBAC baseline, then uploads 5 sources concurrently
+        and immediately re-measures RBAC latency. Compares to quantify whether
+        shared PostgreSQL write load from ingestion degrades RBAC read perf.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+        from datetime import datetime, timedelta
+
+        from conftest import obtain_jwt_token
+
+        print(f"\n{'='*72}")
+        print("PERF-RBAC-006: RBAC Latency Under Ingestion Load")
+        print(f"{'='*72}\n")
+
+        rbac_access = _rbac_access_url(gateway_url)
+        session = self._create_session()
+
+        # --- Phase 1: quiescent baseline ---
+        print("Phase 1: Measuring quiescent RBAC baseline (100 calls)...")
+        baseline_latencies = _measure_latency(session, rbac_access, n=100)
+        baseline = calculate_percentiles(baseline_latencies)
+        print(f"  Baseline: p50={baseline['p50']*1000:.1f}ms "
+              f"p95={baseline['p95']*1000:.1f}ms")
+
+        # --- Phase 2: start ingestion ---
+        print("\nPhase 2: Starting ingestion (5 sources)...")
+        ingress_url = f"{gateway_url.rstrip('/')}/api/ingress"
+        jwt = obtain_jwt_token(self._keycloak_config)
+        ingress_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=ingress")
+        koku_api_url = f"{gateway_url.rstrip('/')}/api/cost-management/v1"
+
+        from utils import create_rh_identity_header
+        rh_identity = create_rh_identity_header("org1234567")
+
+        source_count = 5
+        sources = []
+        for i in range(source_count):
+            try:
+                source, cluster_id, source_name = register_tracked_source(
+                    self.namespace, ingress_pod, koku_api_url,
+                    rh_identity, perf_cleanup, prefix=f"rbac-ing-{i}",
+                )
+                sources.append((source, cluster_id, source_name))
+            except Exception as e:
+                print(f"  WARN: Failed to register source {i}: {e}")
+
+        if not sources:
+            pytest.skip("Could not register any sources for ingestion")
+
+        print(f"  Registered {len(sources)} sources, uploading concurrently...")
+
+        now = datetime.now()
+        start_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
+        end_date = now.strftime("%Y-%m-%d")
+
+        def _upload_one(idx, _source, _cluster_id, _source_name):
+            try:
+                return generate_and_upload_data(
+                    _cluster_id, _source_name,
+                    datetime.strptime(start_date, "%Y-%m-%d"),
+                    datetime.strptime(end_date, "%Y-%m-%d"),
+                    ingress_url, jwt,
+                )
+            except Exception as e:
+                print(f"  Upload {idx} failed: {e}")
+                return None
+
+        with ThreadPoolExecutor(max_workers=source_count) as pool:
+            futures = [
+                pool.submit(_upload_one, i, s[0], s[1], s[2])
+                for i, s in enumerate(sources)
+            ]
+
+        upload_ok = sum(1 for f in futures if f.result() is not None)
+        print(f"  {upload_ok}/{len(sources)} uploads completed")
+
+        # --- Phase 3: measure RBAC under load ---
+        print("\nPhase 3: Measuring RBAC latency during processing "
+              f"(concurrency=10, 60s)...")
+
+        pg_before = capture_pg_stats(
+            self.namespace,
+            database_config.pod_name,
+            database_config.database,
+            database_config.user,
+        )
+
+        under_load = _measure_latency_concurrent(
+            session_factory=self._create_session,
+            url=rbac_access,
+            concurrency=10,
+            duration_s=60.0,
+        )
+
+        pg_after = capture_pg_stats(
+            self.namespace,
+            database_config.pod_name,
+            database_config.database,
+            database_config.user,
+        )
+        pg_delta = diff_pg_stats(pg_before, pg_after)
+
+        # --- Summary ---
+        degradation_p50 = (under_load["p50"] / baseline["p50"]
+                           if baseline["p50"] > 0 else 0)
+        degradation_p95 = (under_load["p95"] / baseline["p95"]
+                           if baseline["p95"] > 0 else 0)
+
+        print(f"\n{'='*72}")
+        print("RBAC-006 SUMMARY: Under Ingestion Load")
+        print(f"{'='*72}")
+        print(f"Quiescent: p50={baseline['p50']*1000:.1f}ms "
+              f"p95={baseline['p95']*1000:.1f}ms")
+        print(f"Under load: p50={under_load['p50']*1000:.1f}ms "
+              f"p95={under_load['p95']*1000:.1f}ms "
+              f"({under_load['requests_per_second']} req/s)")
+        print(f"Degradation: p50={degradation_p50:.1f}×, "
+              f"p95={degradation_p95:.1f}×")
+        print(f"Errors: {under_load.get('errors', 0)}")
+        print(f"PG commits delta: {pg_delta.get('xact_commit_delta', '?')}, "
+              f"cache hit: {pg_delta.get('cache_hit_ratio', '?')}")
+
+        perf_result.test_id = "PERF-RBAC-006"
+        perf_result.metrics = {
+            "baseline": baseline,
+            "under_load": under_load,
+            "degradation_p50": round(degradation_p50, 2),
+            "degradation_p95": round(degradation_p95, 2),
+            "sources_uploaded": upload_ok,
+            "pg_stats": pg_delta,
         }
         perf_result.passed = True
         perf_collector.add_result(perf_result)

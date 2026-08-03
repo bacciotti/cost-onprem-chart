@@ -485,7 +485,7 @@ histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{job="koku-api
 | `test_ros.py` | 4 | ROS/Kruize performance (ROS-001 through ROS-004) |
 | `test_soak.py` | 4 | Soak stability (SOAK-001 through SOAK-004, opt-in) |
 | `test_stress.py` | 2 | Stress ramp-to-failure + backlog recovery (STR-001, STR-002) |
-| `test_rbac_perf.py` | 4 | RBAC authorization performance (RBAC-001 through RBAC-004) |
+| `test_rbac_perf.py` | 6 | RBAC authorization performance (RBAC-001 through RBAC-006) |
 | `profiles.py` | — | Profile definitions + NISE YAML generation |
 | `tracker.py` | — | Resource cleanup tracker with configurable timeout |
 | `conftest.py` | — | Fixtures, cleanup, data generation |

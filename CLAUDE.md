@@ -129,7 +129,7 @@ to node max for perf runs.
 - `tests/suites/performance/conftest.py` — Fixtures, cleanup tracker, cluster info
 - `tests/suites/performance/test_stress.py` — Stress ramp-to-failure + backlog recovery (STR-001, STR-002)
 - `tests/suites/performance/tracker.py` — Resource cleanup tracker with configurable timeout
-- `tests/suites/performance/test_rbac_perf.py` — RBAC authorization performance (RBAC-001 through RBAC-004)
+- `tests/suites/performance/test_rbac_perf.py` — RBAC authorization performance (RBAC-001 through RBAC-006)
 
 ---
 
