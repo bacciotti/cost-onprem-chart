@@ -57,39 +57,51 @@ def _rbac_access_url(gateway_url: str) -> str:
     return f"{gateway_url.rstrip('/')}/api/rbac/v1/access/?application=cost-management"
 
 
+RBAC_VALKEY_DB = 2
+
+
 def _flush_rbac_cache(namespace: str) -> int:
-    """Flush all rbac:* keys from Valkey. Returns count of keys deleted."""
+    """Flush all keys from Valkey DB used by RBAC (Django cache DB 2).
+
+    RBAC's Django cache uses ``redis://…/2`` with its own key format
+    (version-prefixed, e.g. ``:1:key``), so we flush the entire DB
+    rather than pattern-matching on a prefix.
+    """
     pod = get_pod_by_label(namespace, "app.kubernetes.io/component=cache")
     if not pod:
         return -1
 
+    count_result = exec_in_pod(
+        namespace, pod,
+        ["valkey-cli", "-n", str(RBAC_VALKEY_DB), "DBSIZE"],
+        timeout=15,
+    )
+    before_count = 0
+    if count_result:
+        try:
+            before_count = int(count_result.strip())
+        except ValueError:
+            pass
+
     result = exec_in_pod(
         namespace, pod,
-        ["valkey-cli", "EVAL",
-         "local keys = redis.call('KEYS', 'rbac:*'); "
-         "if #keys > 0 then return redis.call('DEL', unpack(keys)) "
-         "else return 0 end",
-         "0"],
+        ["valkey-cli", "-n", str(RBAC_VALKEY_DB), "FLUSHDB"],
         timeout=30,
     )
     if result is None:
         return -1
-    try:
-        return int(result.strip())
-    except ValueError:
-        return -1
+    return before_count
 
 
 def _count_rbac_cache_keys(namespace: str) -> int:
-    """Count rbac:* keys in Valkey."""
+    """Count keys in Valkey DB used by RBAC (DB 2)."""
     pod = get_pod_by_label(namespace, "app.kubernetes.io/component=cache")
     if not pod:
         return -1
 
     result = exec_in_pod(
         namespace, pod,
-        ["valkey-cli", "EVAL",
-         "return #redis.call('KEYS', 'rbac:*')", "0"],
+        ["valkey-cli", "-n", str(RBAC_VALKEY_DB), "DBSIZE"],
         timeout=15,
     )
     if result is None:
@@ -459,7 +471,6 @@ class TestRBACPerf:
         self,
         org_count: int,
         cluster_config: ClusterConfig,
-        database_config: DatabaseConfig,
         gateway_url: str,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
@@ -486,10 +497,11 @@ class TestRBACPerf:
             pytest.skip("Database pod not found")
 
         from utils import execute_db_query
+        rbac_db_user = "postgres"
         tenant_rows = execute_db_query(
             self.namespace, db_pod,
             "costonprem_rbac",
-            database_config.user,
+            rbac_db_user,
             "SELECT count(*) FROM api_tenant;",
         )
         current_tenants = 0
@@ -517,11 +529,11 @@ class TestRBACPerf:
 
         # Get RBAC table sizes
         table_sizes = {}
-        for table in ["api_tenant", "api_principal", "api_group", "api_policy", "api_role"]:
+        for table in ["api_tenant", "api_principal", "management_group", "management_policy", "management_role"]:
             size_result = execute_db_query(
                 self.namespace, db_pod,
                 "costonprem_rbac",
-                database_config.user,
+                rbac_db_user,
                 f"SELECT count(*) FROM {table};",
             )
             if size_result and size_result[0]:
