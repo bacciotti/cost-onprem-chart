@@ -32,7 +32,7 @@ import pytest
 import requests as _requests
 
 from conftest import ClusterConfig, DatabaseConfig
-from utils import exec_in_pod, get_pod_by_label, run_oc_command
+from utils import exec_in_pod, exec_in_pod_raw, get_pod_by_label, run_oc_command
 
 from .data_classes import PerformanceResult
 from .helpers import (
@@ -40,7 +40,6 @@ from .helpers import (
     PerfTimer,
     create_authenticated_session,
     generate_and_upload_data,
-    register_tracked_source,
 )
 from .k8s_helpers import (
     calculate_percentiles,
@@ -197,6 +196,123 @@ def _measure_latency_concurrent(
     stats["requests_per_second"] = round(len(all_latencies) / max(duration_s, 0.1), 1)
     stats["concurrency"] = concurrency
     return stats
+
+
+# =============================================================================
+# Multi-org tenant provisioning
+# =============================================================================
+
+_PERF_ORG_PREFIX = "rbac-perf-org"
+_PERF_ACCT_PREFIX = "rbac-perf-acct"
+
+
+def _count_rbac_tenants(namespace: str, db_pod: str) -> int:
+    """Return the current tenant count in the RBAC database."""
+    from utils import execute_db_query
+    rows = execute_db_query(
+        namespace, db_pod, "costonprem_rbac", "postgres",
+        "SELECT count(*) FROM api_tenant;",
+    )
+    if rows and rows[0]:
+        try:
+            return int(rows[0][0])
+        except (ValueError, IndexError):
+            pass
+    return 0
+
+
+def _provision_rbac_tenants(
+    namespace: str,
+    target_count: int,
+    db_pod: str,
+) -> list[str]:
+    """Provision ephemeral RBAC tenants via the Django ORM.
+
+    Creates ``api_tenant`` rows directly through the RBAC management shell.
+    This is the most reliable approach — the gateway trigger and
+    ``bootstrap_tenants`` command do not consistently insert ``api_tenant``
+    rows for freshly created org_ids.
+
+    Returns a list of org_id strings for cleanup.
+    """
+    current = _count_rbac_tenants(namespace, db_pod)
+    needed = target_count - current
+    if needed <= 0:
+        return []
+
+    rbac_pod = get_pod_by_label(namespace, "app.kubernetes.io/component=rbac-api")
+    if not rbac_pod:
+        pytest.skip("RBAC API pod not found — cannot provision tenants")
+
+    provisioned_orgs: list[str] = []
+    print(f"  Provisioning {needed} tenant(s) via RBAC ORM (current={current}, target={target_count})...")
+
+    # Batch-create all tenants in one exec call
+    org_ids = [f"{_PERF_ORG_PREFIX}-{current + i + 1:04d}" for i in range(needed)]
+    orm_script = "from api.models import Tenant\n"
+    for org_id in org_ids:
+        orm_script += (
+            f"t, c = Tenant.objects.get_or_create("
+            f"org_id={org_id!r}, "
+            f"defaults={{'tenant_name': {org_id!r}, 'ready': True}})\n"
+            f"print(f'  {{\"created\" if c else \"exists\"}}: org_id={{t.org_id!r}} id={{t.id}}')\n"
+        )
+    orm_script += f"print(f'Total tenants: {{Tenant.objects.count()}}')\n"
+
+    try:
+        result = exec_in_pod_raw(
+            namespace, rbac_pod,
+            ["python", "/opt/rbac/rbac/manage.py", "shell", "-c", orm_script],
+            timeout=60,
+        )
+        if result.stdout:
+            for line in result.stdout.strip().splitlines():
+                if not line.startswith("GLITCHTIP") and "imported automatically" not in line:
+                    print(f"    {line}")
+        if result.returncode != 0 and result.stderr:
+            print(f"  WARN: ORM stderr: {result.stderr.strip()[:200]}")
+    except Exception as e:
+        print(f"  WARN: Tenant ORM provisioning failed: {e}")
+        return []
+
+    new_count = _count_rbac_tenants(namespace, db_pod)
+    provisioned_orgs = [oid for oid in org_ids if new_count > current]
+    print(f"  Tenant count after provisioning: {new_count}")
+    return provisioned_orgs if new_count >= target_count else provisioned_orgs
+
+
+def _cleanup_rbac_tenants(
+    namespace: str,
+    provisioned_orgs: list[str],
+    db_pod: str,
+) -> None:
+    """Remove ephemeral tenants created by _provision_rbac_tenants."""
+    if not provisioned_orgs:
+        return
+
+    rbac_pod = get_pod_by_label(namespace, "app.kubernetes.io/component=rbac-api")
+    if not rbac_pod:
+        print("  WARN: RBAC API pod not found — cannot clean up tenants")
+        return
+
+    quoted = ", ".join(f"'{o}'" for o in provisioned_orgs)
+    orm_script = (
+        "from api.models import Tenant\n"
+        f"deleted, _ = Tenant.objects.filter(org_id__in=[{quoted}]).delete()\n"
+        f"print(f'Deleted {{deleted}} tenant(s), remaining: {{Tenant.objects.count()}}')\n"
+    )
+    try:
+        result = exec_in_pod_raw(
+            namespace, rbac_pod,
+            ["python", "/opt/rbac/rbac/manage.py", "shell", "-c", orm_script],
+            timeout=30,
+        )
+        if result.stdout:
+            for line in result.stdout.strip().splitlines():
+                if not line.startswith("GLITCHTIP") and "imported automatically" not in line:
+                    print(f"    {line}")
+    except Exception as e:
+        print(f"  WARN: Tenant cleanup failed: {e}")
 
 
 # =============================================================================
@@ -489,86 +605,86 @@ class TestRBACPerf:
     ):
         """PERF-RBAC-004: Measure RBAC latency with varying org count.
 
-        Checks how many tenants exist in the RBAC database, then
-        measures access-check latency. If RBAC queries are properly
-        scoped per-tenant, latency should be flat regardless of org count.
-
-        This test is informational — it measures the current state rather
-        than provisioning additional orgs (which would require Keycloak
-        sync and is destructive to the test environment).
+        Provisions ephemeral tenants (via Keycloak + gateway trigger +
+        bootstrap_tenants) up to the target count, measures access-check
+        latency, then cleans up. If RBAC queries are properly scoped
+        per-tenant, latency should be flat regardless of org count.
         """
         print(f"\n{'='*72}")
         print(f"PERF-RBAC-004: Multi-Org Scaling Check (target={org_count})")
         print(f"{'='*72}\n")
 
-        # Count current tenants in RBAC database
         db_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=database")
         if not db_pod:
             pytest.skip("Database pod not found")
 
         from utils import execute_db_query
-        rbac_db_user = "postgres"
-        tenant_rows = execute_db_query(
-            self.namespace, db_pod,
-            "costonprem_rbac",
-            rbac_db_user,
-            "SELECT count(*) FROM api_tenant;",
-        )
-        current_tenants = 0
-        if tenant_rows and tenant_rows[0]:
-            try:
-                current_tenants = int(tenant_rows[0][0])
-            except (ValueError, IndexError):
-                pass
 
+        current_tenants = _count_rbac_tenants(self.namespace, db_pod)
         print(f"Current tenant count in RBAC DB: {current_tenants}")
 
-        if current_tenants < org_count:
-            pytest.skip(
-                f"Need {org_count} orgs but only {current_tenants} exist. "
-                f"Multi-org provisioning requires Keycloak sync."
-            )
+        provisioned_orgs: list[str] = []
+        try:
+            if current_tenants < org_count:
+                provisioned_orgs = _provision_rbac_tenants(
+                    self.namespace, org_count, db_pod,
+                )
+                current_tenants = _count_rbac_tenants(self.namespace, db_pod)
+                if current_tenants < org_count:
+                    pytest.skip(
+                        f"Provisioning reached {current_tenants} tenants, "
+                        f"still short of target {org_count}"
+                    )
 
-        session = self._create_session()
-        rbac_access = _rbac_access_url(gateway_url)
+            session = self._create_session()
+            rbac_access = _rbac_access_url(gateway_url)
 
-        # Measure RBAC latency at current org count
-        print(f"Measuring RBAC latency with {current_tenants} tenants (100 calls)...")
-        latencies = _measure_latency(session, rbac_access, n=100)
-        stats = calculate_percentiles(latencies)
+            print(f"Measuring RBAC latency with {current_tenants} tenants (100 calls)...")
+            latencies = _measure_latency(session, rbac_access, n=100)
+            stats = calculate_percentiles(latencies)
 
-        # Get RBAC table sizes
-        table_sizes = {}
-        for table in ["api_tenant", "api_principal", "management_group", "management_policy", "management_role"]:
-            size_result = execute_db_query(
-                self.namespace, db_pod,
-                "costonprem_rbac",
-                rbac_db_user,
-                f"SELECT count(*) FROM {table};",
-            )
-            if size_result and size_result[0]:
-                try:
-                    table_sizes[table] = int(size_result[0][0])
-                except (ValueError, IndexError):
-                    pass
+            table_sizes = {}
+            for table in ["api_tenant", "api_principal", "management_group",
+                          "management_policy", "management_role"]:
+                size_result = execute_db_query(
+                    self.namespace, db_pod,
+                    "costonprem_rbac", "postgres",
+                    f"SELECT count(*) FROM {table};",
+                )
+                if size_result and size_result[0]:
+                    try:
+                        table_sizes[table] = int(size_result[0][0])
+                    except (ValueError, IndexError):
+                        pass
 
-        print(f"\n{'='*72}")
-        print(f"RBAC-004 SUMMARY (tenants={current_tenants}, target={org_count})")
-        print(f"{'='*72}")
-        print(f"Latency: p50={stats['p50']*1000:.1f}ms "
-              f"p95={stats['p95']*1000:.1f}ms "
-              f"p99={stats['p99']*1000:.1f}ms")
-        print(f"RBAC table sizes: {table_sizes}")
+            print(f"\n{'='*72}")
+            print(f"RBAC-004 SUMMARY (tenants={current_tenants}, target={org_count})")
+            print(f"{'='*72}")
+            print(f"Latency: p50={stats['p50']*1000:.1f}ms "
+                  f"p95={stats['p95']*1000:.1f}ms "
+                  f"p99={stats['p99']*1000:.1f}ms")
+            print(f"RBAC table sizes: {table_sizes}")
+            if provisioned_orgs:
+                print(f"Provisioned {len(provisioned_orgs)} ephemeral tenant(s)")
 
-        perf_result.test_id = f"PERF-RBAC-004[{org_count}]"
-        perf_result.metrics = {
-            "org_count_target": org_count,
-            "actual_tenants": current_tenants,
-            "latency": stats,
-            "table_sizes": table_sizes,
-        }
-        perf_result.passed = True
-        perf_collector.add_result(perf_result)
+            perf_result.test_id = f"PERF-RBAC-004[{org_count}]"
+            perf_result.metrics = {
+                "org_count_target": org_count,
+                "actual_tenants": current_tenants,
+                "provisioned_count": len(provisioned_orgs),
+                "latency": stats,
+                "table_sizes": table_sizes,
+            }
+            perf_result.passed = True
+            perf_collector.add_result(perf_result)
+        finally:
+            if provisioned_orgs:
+                print(f"\nCleaning up {len(provisioned_orgs)} ephemeral tenant(s)...")
+                _cleanup_rbac_tenants(
+                    self.namespace, provisioned_orgs, db_pod,
+                )
+                final_count = _count_rbac_tenants(self.namespace, db_pod)
+                print(f"Tenant count after cleanup: {final_count}")
 
     # -----------------------------------------------------------------
     # RBAC-005: Replica scaling
@@ -686,6 +802,10 @@ class TestRBACPerf:
         cluster_config: ClusterConfig,
         database_config: DatabaseConfig,
         gateway_url: str,
+        ingress_url: str,
+        koku_api_url: str,
+        rh_identity_header: str,
+        ingress_pod: str,
         perf_timer: PerfTimer,
         perf_result: PerformanceResult,
         perf_collector: PerfResultCollector,
@@ -702,6 +822,7 @@ class TestRBACPerf:
         from datetime import datetime, timedelta
 
         from conftest import obtain_jwt_token
+        from e2e_helpers import generate_cluster_id, register_source
 
         print(f"\n{'='*72}")
         print("PERF-RBAC-006: RBAC Latency Under Ingestion Load")
@@ -717,23 +838,29 @@ class TestRBACPerf:
         print(f"  Baseline: p50={baseline['p50']*1000:.1f}ms "
               f"p95={baseline['p95']*1000:.1f}ms")
 
-        # --- Phase 2: start ingestion ---
+        # --- Phase 2: register sources and start ingestion ---
         print("\nPhase 2: Starting ingestion (5 sources)...")
-        ingress_url = f"{gateway_url.rstrip('/')}/api/ingress"
         jwt = obtain_jwt_token(self._keycloak_config)
-        ingress_pod = get_pod_by_label(self.namespace, "app.kubernetes.io/component=ingress")
-        koku_api_url = f"{gateway_url.rstrip('/')}/api/cost-management/v1"
-
-        from utils import create_rh_identity_header
-        rh_identity = create_rh_identity_header("org1234567")
 
         source_count = 5
         sources = []
         for i in range(source_count):
             try:
-                source, cluster_id, source_name = register_tracked_source(
-                    self.namespace, ingress_pod, koku_api_url,
-                    rh_identity, perf_cleanup, prefix=f"rbac-ing-{i}",
+                cluster_id = generate_cluster_id()
+                source_name = f"rbac-ing-{i}-{cluster_id[-6:]}"
+                source = register_source(
+                    self.namespace,
+                    ingress_pod,
+                    koku_api_url,
+                    rh_identity_header,
+                    cluster_id,
+                    "org1234567",
+                    source_name,
+                )
+                perf_cleanup.track(
+                    source_id=source.source_id,
+                    cluster_id=cluster_id,
+                    source_name=source_name,
                 )
                 sources.append((source, cluster_id, source_name))
             except Exception as e:
