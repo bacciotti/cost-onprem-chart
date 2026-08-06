@@ -22,17 +22,25 @@ Usage:
     PERF_PROFILE=medium pytest -m "performance and rbac_perf" tests/suites/performance/
 """
 
+import re
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List
 
 import pytest
 import requests as _requests
 
-from conftest import ClusterConfig, DatabaseConfig
-from utils import exec_in_pod, exec_in_pod_raw, get_pod_by_label, run_oc_command
+from conftest import ClusterConfig, DatabaseConfig, obtain_jwt_token
+from e2e_helpers import generate_cluster_id, register_source
+from utils import (
+    exec_in_pod,
+    exec_in_pod_raw,
+    execute_db_query,
+    get_pod_by_label,
+    run_oc_command,
+)
 
 from .data_classes import PerformanceResult
 from .helpers import (
@@ -188,8 +196,9 @@ def _measure_latency_concurrent(
 
     time.sleep(duration_s)
     stop_event.set()
+    # Allow up to the HTTP timeout for in-flight requests to complete
     for t in threads:
-        t.join(timeout=10)
+        t.join(timeout=timeout + 5)
 
     stats = calculate_percentiles(all_latencies, errors=error_count)
     stats["total_requests"] = len(all_latencies)
@@ -208,7 +217,6 @@ _PERF_ACCT_PREFIX = "rbac-perf-acct"
 
 def _count_rbac_tenants(namespace: str, db_pod: str) -> int:
     """Return the current tenant count in the RBAC database."""
-    from utils import execute_db_query
     rows = execute_db_query(
         namespace, db_pod, "costonprem_rbac", "postgres",
         "SELECT count(*) FROM api_tenant;",
@@ -225,7 +233,7 @@ def _provision_rbac_tenants(
     namespace: str,
     target_count: int,
     db_pod: str,
-) -> list[str]:
+) -> List[str]:
     """Provision ephemeral RBAC tenants via the Django ORM.
 
     Creates ``api_tenant`` rows directly through the RBAC management shell.
@@ -244,7 +252,7 @@ def _provision_rbac_tenants(
     if not rbac_pod:
         pytest.skip("RBAC API pod not found — cannot provision tenants")
 
-    provisioned_orgs: list[str] = []
+    provisioned_orgs: List[str] = []
     print(f"  Provisioning {needed} tenant(s) via RBAC ORM (current={current}, target={target_count})...")
 
     # Batch-create all tenants in one exec call
@@ -269,6 +277,10 @@ def _provision_rbac_tenants(
             for line in result.stdout.strip().splitlines():
                 if not line.startswith("GLITCHTIP") and "imported automatically" not in line:
                     print(f"    {line}")
+                    # Track which orgs were actually created
+                    m = re.search(r"created: org_id='([^']+)'", line)
+                    if m:
+                        provisioned_orgs.append(m.group(1))
         if result.returncode != 0 and result.stderr:
             print(f"  WARN: ORM stderr: {result.stderr.strip()[:200]}")
     except Exception as e:
@@ -276,14 +288,13 @@ def _provision_rbac_tenants(
         return []
 
     new_count = _count_rbac_tenants(namespace, db_pod)
-    provisioned_orgs = [oid for oid in org_ids if new_count > current]
     print(f"  Tenant count after provisioning: {new_count}")
-    return provisioned_orgs if new_count >= target_count else provisioned_orgs
+    return provisioned_orgs
 
 
 def _cleanup_rbac_tenants(
     namespace: str,
-    provisioned_orgs: list[str],
+    provisioned_orgs: List[str],
     db_pod: str,
 ) -> None:
     """Remove ephemeral tenants created by _provision_rbac_tenants."""
@@ -450,11 +461,11 @@ class TestRBACPerf:
         session = self._create_session()
         rbac_access = _rbac_access_url(gateway_url)
 
-        # Flush RBAC cache
-        deleted = _flush_rbac_cache(self.namespace)
-        print(f"Flushed {deleted} rbac:* keys from Valkey")
+        # Flush RBAC cache (Valkey DB 2)
+        before_count = _flush_rbac_cache(self.namespace)
+        print(f"Flushed Valkey DB {RBAC_VALKEY_DB} ({before_count} keys)")
 
-        if deleted < 0:
+        if before_count < 0:
             pytest.skip("Could not flush Valkey RBAC cache")
 
         # Cold (cache miss) measurement
@@ -577,15 +588,22 @@ class TestRBACPerf:
         print(f"PG commits: {pg_delta.get('xact_commit_delta', '?')}, "
               f"cache hit: {pg_delta.get('cache_hit_ratio', '?')}")
 
+        error_rate = stats.get("errors", 0) / max(stats["total_requests"], 1)
         perf_result.test_id = f"PERF-RBAC-003[{concurrency}]"
         perf_result.metrics = {
             "concurrency": concurrency,
             "latency": stats,
             "rbac_pod": pod_metrics,
             "pg_stats": pg_delta,
+            "error_rate": round(error_rate, 4),
         }
-        perf_result.passed = True
+        perf_result.passed = error_rate < 0.05
         perf_collector.add_result(perf_result)
+
+        assert error_rate < 0.05, (
+            f"RBAC-003[{concurrency}]: error rate {error_rate:.1%} exceeds 5% "
+            f"({stats.get('errors', 0)}/{stats['total_requests']} requests)"
+        )
 
     # -----------------------------------------------------------------
     # RBAC-004: Multi-org scaling (conditional)
@@ -618,12 +636,10 @@ class TestRBACPerf:
         if not db_pod:
             pytest.skip("Database pod not found")
 
-        from utils import execute_db_query
-
         current_tenants = _count_rbac_tenants(self.namespace, db_pod)
         print(f"Current tenant count in RBAC DB: {current_tenants}")
 
-        provisioned_orgs: list[str] = []
+        provisioned_orgs: List[str] = []
         try:
             if current_tenants < org_count:
                 provisioned_orgs = _provision_rbac_tenants(
@@ -737,20 +753,22 @@ class TestRBACPerf:
                     duration_s=duration,
                 )
 
-                rbac_pod = get_pod_by_label(
-                    self.namespace, "app.kubernetes.io/component=rbac-api"
+                pod_metrics = []
+                result = run_oc_command(
+                    ["adm", "top", "pod",
+                     "-l", "app.kubernetes.io/component=rbac-api",
+                     "-n", self.namespace, "--no-headers"],
+                    check=False,
                 )
-                pod_metrics = {}
-                if rbac_pod:
-                    result = run_oc_command(
-                        ["adm", "top", "pod", rbac_pod,
-                         "-n", self.namespace, "--no-headers"],
-                        check=False,
-                    )
-                    if result.returncode == 0 and result.stdout.strip():
-                        parts = result.stdout.strip().split()
+                if result.returncode == 0 and result.stdout.strip():
+                    for line in result.stdout.strip().splitlines():
+                        parts = line.split()
                         if len(parts) >= 3:
-                            pod_metrics = {"cpu": parts[1], "memory": parts[2]}
+                            pod_metrics.append({
+                                "pod": parts[0],
+                                "cpu": parts[1],
+                                "memory": parts[2],
+                            })
 
                 results_by_replicas[replica_count] = {
                     "latency": stats,
@@ -818,12 +836,6 @@ class TestRBACPerf:
         and immediately re-measures RBAC latency. Compares to quantify whether
         shared PostgreSQL write load from ingestion degrades RBAC read perf.
         """
-        from concurrent.futures import ThreadPoolExecutor
-        from datetime import datetime, timedelta
-
-        from conftest import obtain_jwt_token
-        from e2e_helpers import generate_cluster_id, register_source
-
         print(f"\n{'='*72}")
         print("PERF-RBAC-006: RBAC Latency Under Ingestion Load")
         print(f"{'='*72}\n")
@@ -871,16 +883,15 @@ class TestRBACPerf:
 
         print(f"  Registered {len(sources)} sources, uploading concurrently...")
 
-        now = datetime.now()
-        start_date = (now - timedelta(days=2)).strftime("%Y-%m-%d")
-        end_date = now.strftime("%Y-%m-%d")
+        now = datetime.now(timezone.utc)
+        end_dt = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_dt = end_dt - timedelta(days=2)
 
         def _upload_one(idx, _source, _cluster_id, _source_name):
             try:
                 return generate_and_upload_data(
                     _cluster_id, _source_name,
-                    datetime.strptime(start_date, "%Y-%m-%d"),
-                    datetime.strptime(end_date, "%Y-%m-%d"),
+                    start_dt, end_dt,
                     ingress_url, jwt,
                 )
             except Exception as e:
@@ -942,6 +953,12 @@ class TestRBACPerf:
         print(f"PG commits delta: {pg_delta.get('xact_commit_delta', '?')}, "
               f"cache hit: {pg_delta.get('cache_hit_ratio', '?')}")
 
+        error_rate = under_load.get("errors", 0) / max(under_load["total_requests"], 1)
+        # Under ingestion load, up to 50x degradation is acceptable — we're
+        # testing that RBAC still responds, not that it's fast.
+        max_degradation = 50.0
+        passed = error_rate < 0.05 and degradation_p95 < max_degradation
+
         perf_result.test_id = "PERF-RBAC-006"
         perf_result.metrics = {
             "baseline": baseline,
@@ -950,6 +967,16 @@ class TestRBACPerf:
             "degradation_p95": round(degradation_p95, 2),
             "sources_uploaded": upload_ok,
             "pg_stats": pg_delta,
+            "error_rate": round(error_rate, 4),
         }
-        perf_result.passed = True
+        perf_result.passed = passed
         perf_collector.add_result(perf_result)
+
+        assert error_rate < 0.05, (
+            f"RBAC-006: error rate {error_rate:.1%} exceeds 5% under ingestion load"
+        )
+        assert degradation_p95 < max_degradation, (
+            f"RBAC-006: p95 degradation {degradation_p95:.1f}x exceeds "
+            f"{max_degradation}x ceiling (baseline={baseline['p95']*1000:.1f}ms, "
+            f"under_load={under_load['p95']*1000:.1f}ms)"
+        )

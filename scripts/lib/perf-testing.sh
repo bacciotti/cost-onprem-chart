@@ -389,6 +389,7 @@ run_performance_tests() {
     if [[ "${PERF_SUITE}" == "all" ]]; then
         # "all" runs every suite EXCEPT stress and soak tests (which can
         # take hours to days). Request those explicitly when needed.
+        # NOTE: When adding a new perf suite, add it here too.
         perf_args+=("--perf-api" "--perf-ros" "--perf-ingestion" "--perf-scale"
                     "--perf-valkey" "--perf-db" "--perf-kafka"
                     "--perf-celery" "--perf-rbac")
