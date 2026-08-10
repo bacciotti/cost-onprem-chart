@@ -134,21 +134,28 @@ def _measure_latency(
     url: str,
     n: int = 100,
     timeout: float = 30.0,
-) -> List[float]:
-    """Make N sequential GET requests and return latencies in seconds."""
-    latencies = []
+) -> Dict[str, Any]:
+    """Make N sequential GET requests and return success latencies + error count.
+
+    Error latencies (timeouts, connection failures, 5xx) are excluded from the
+    returned list so they don't skew percentile calculations.
+    """
+    latencies: List[float] = []
+    errors = 0
     for _ in range(n):
         start = time.time()
         try:
             resp = session.get(url, timeout=timeout)
             elapsed = time.time() - start
-            latencies.append(elapsed)
             if resp.status_code >= 500:
+                errors += 1
                 print(f"  [latency] {url} returned {resp.status_code}")
+            else:
+                latencies.append(elapsed)
         except _requests.RequestException as e:
-            latencies.append(time.time() - start)
+            errors += 1
             print(f"  [latency] {url} error: {e}")
-    return latencies
+    return {"latencies": latencies, "errors": errors, "total": n}
 
 
 def _measure_latency_concurrent(
@@ -178,11 +185,11 @@ def _measure_latency_concurrent(
             try:
                 resp = sess.get(url, timeout=timeout)
                 elapsed = time.time() - start
-                local_latencies.append(elapsed)
                 if resp.status_code >= 500:
                     local_errors += 1
+                else:
+                    local_latencies.append(elapsed)
             except _requests.RequestException:
-                local_latencies.append(time.time() - start)
                 local_errors += 1
         with lock:
             all_latencies.extend(local_latencies)
@@ -200,9 +207,11 @@ def _measure_latency_concurrent(
     for t in threads:
         t.join(timeout=timeout + 5)
 
+    total = len(all_latencies) + error_count
     stats = calculate_percentiles(all_latencies, errors=error_count)
-    stats["total_requests"] = len(all_latencies)
-    stats["requests_per_second"] = round(len(all_latencies) / max(duration_s, 0.1), 1)
+    stats["total_requests"] = total
+    stats["successful_requests"] = len(all_latencies)
+    stats["requests_per_second"] = round(total / max(duration_s, 0.1), 1)
     stats["concurrency"] = concurrency
     return stats
 
@@ -390,16 +399,17 @@ class TestRBACPerf:
 
         # Measure direct RBAC latency (100 sequential calls)
         print("Measuring direct RBAC latency (100 calls)...")
-        rbac_latencies = _measure_latency(session, rbac_access, n=100)
-        rbac_stats = calculate_percentiles(rbac_latencies)
+        rbac_result = _measure_latency(session, rbac_access, n=100)
+        rbac_stats = calculate_percentiles(rbac_result["latencies"])
         print(f"  RBAC direct: p50={rbac_stats['p50']*1000:.1f}ms "
               f"p95={rbac_stats['p95']*1000:.1f}ms "
-              f"p99={rbac_stats['p99']*1000:.1f}ms")
+              f"p99={rbac_stats['p99']*1000:.1f}ms "
+              f"(errors={rbac_result['errors']})")
 
         # Measure end-to-end Koku API latency (100 sequential calls)
         print("Measuring end-to-end Koku API latency (100 calls)...")
-        koku_latencies = _measure_latency(session, koku_reports, n=100)
-        koku_stats = calculate_percentiles(koku_latencies)
+        koku_result = _measure_latency(session, koku_reports, n=100)
+        koku_stats = calculate_percentiles(koku_result["latencies"])
         print(f"  Koku API:    p50={koku_stats['p50']*1000:.1f}ms "
               f"p95={koku_stats['p95']*1000:.1f}ms "
               f"p99={koku_stats['p99']*1000:.1f}ms")
@@ -448,11 +458,13 @@ class TestRBACPerf:
         perf_collector: PerfResultCollector,
         keycloak_config,
     ):
-        """PERF-RBAC-002: Measure cache-hit vs cache-miss latency.
+        """PERF-RBAC-002: Determine whether the RBAC Valkey cache provides measurable latency reduction.
 
-        Flushes RBAC keys from Valkey, measures cold (miss) latency,
-        then measures warm (hit) latency. The delta quantifies the
-        value of the RBAC cache.
+        Flushes RBAC keys from Valkey DB 2, measures cold (miss) latency,
+        then measures warm (hit) latency. A speedup >1x indicates the
+        cache is effective; ~1x or below indicates Koku's own upstream
+        cache (CACHE_TIMEOUT) absorbs repeated queries before they
+        reach Valkey.
         """
         print(f"\n{'='*72}")
         print("PERF-RBAC-002: Cache Effectiveness")
@@ -470,8 +482,8 @@ class TestRBACPerf:
 
         # Cold (cache miss) measurement
         print("Measuring cold latency (cache miss, 50 calls)...")
-        cold_latencies = _measure_latency(session, rbac_access, n=50)
-        cold_stats = calculate_percentiles(cold_latencies)
+        cold_result = _measure_latency(session, rbac_access, n=50)
+        cold_stats = calculate_percentiles(cold_result["latencies"])
         print(f"  Cold: p50={cold_stats['p50']*1000:.1f}ms "
               f"p95={cold_stats['p95']*1000:.1f}ms")
 
@@ -480,8 +492,8 @@ class TestRBACPerf:
 
         # Warm (cache hit) measurement — cache should now be populated
         print("Measuring warm latency (cache hit, 50 calls)...")
-        warm_latencies = _measure_latency(session, rbac_access, n=50)
-        warm_stats = calculate_percentiles(warm_latencies)
+        warm_result = _measure_latency(session, rbac_access, n=50)
+        warm_stats = calculate_percentiles(warm_result["latencies"])
         print(f"  Warm: p50={warm_stats['p50']*1000:.1f}ms "
               f"p95={warm_stats['p95']*1000:.1f}ms")
 
@@ -656,8 +668,8 @@ class TestRBACPerf:
             rbac_access = _rbac_access_url(gateway_url)
 
             print(f"Measuring RBAC latency with {current_tenants} tenants (100 calls)...")
-            latencies = _measure_latency(session, rbac_access, n=100)
-            stats = calculate_percentiles(latencies)
+            lat_result = _measure_latency(session, rbac_access, n=100)
+            stats = calculate_percentiles(lat_result["latencies"])
 
             table_sizes = {}
             for table in ["api_tenant", "api_principal", "management_group",
@@ -742,7 +754,13 @@ class TestRBACPerf:
                     print(f"  WARN: Failed to scale to {replica_count}, skipping")
                     continue
 
-                time.sleep(5)
+                result = run_oc_command(
+                    ["rollout", "status", f"deployment/{rbac_deploy}",
+                     "-n", self.namespace, "--timeout=60s"],
+                    check=False, timeout=90,
+                )
+                if result.returncode != 0:
+                    print(f"  WARN: Rollout not ready after 60s, proceeding anyway")
 
                 print(f"  Running concurrent load (concurrency={concurrency}, "
                       f"duration={duration}s)...")
@@ -845,8 +863,8 @@ class TestRBACPerf:
 
         # --- Phase 1: quiescent baseline ---
         print("Phase 1: Measuring quiescent RBAC baseline (100 calls)...")
-        baseline_latencies = _measure_latency(session, rbac_access, n=100)
-        baseline = calculate_percentiles(baseline_latencies)
+        baseline_result = _measure_latency(session, rbac_access, n=100)
+        baseline = calculate_percentiles(baseline_result["latencies"])
         print(f"  Baseline: p50={baseline['p50']*1000:.1f}ms "
               f"p95={baseline['p95']*1000:.1f}ms")
 
