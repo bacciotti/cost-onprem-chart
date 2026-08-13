@@ -1249,6 +1249,19 @@ deploy_helm_chart() {
         echo_warning "RHBK not detected — Keycloak values will use chart defaults"
     fi
 
+    # QE_SCHEMA: bypass cost model debounce for testing environments.
+    # Derived from first orgAdmin user's orgId (schema = "org" + orgId).
+    local qe_org_id=""
+    if [ -n "$VALUES_FILE" ] && [ -f "$VALUES_FILE" ] && command_exists yq; then
+        qe_org_id=$(yq e '.jwtAuth.realmUsers[] | select(.orgAdmin == true) | .orgId' "$VALUES_FILE" 2>/dev/null | head -1)
+    fi
+    qe_org_id="${qe_org_id:-org1234567}"
+    if [ -n "$qe_org_id" ] && [ "$qe_org_id" != "null" ]; then
+        local qe_schema="org${qe_org_id}"
+        helm_cmd="$helm_cmd --set costManagement.qeSchema=\"$qe_schema\""
+        echo_info "QE_SCHEMA: $qe_schema (debounce bypass for testing)"
+    fi
+
     # S3 endpoint configuration for Helm:
     # If user pre-configured S3 in values.yaml, skip all --set overrides
     # (the values file already has the right config).
