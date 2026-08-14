@@ -391,6 +391,10 @@ Common environment variables for Koku API and Celery
   value: "/api/rbac/v1/access/"
 - name: RBAC_SERVICE_PROTOCOL
   value: "http"
+{{- if .Values.costManagement.qeSchema }}
+- name: QE_SCHEMA
+  value: {{ .Values.costManagement.qeSchema | quote }}
+{{- end }}
 {{- end -}}
 
 {{/*
