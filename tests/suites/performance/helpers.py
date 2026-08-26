@@ -32,23 +32,38 @@ from .queue_helpers import get_celery_queue_depths
 # Centralized Performance Test Configuration
 # ---------------------------------------------------------------------------
 
+_SOAK_CONDENSED = os.environ.get("SOAK_CONDENSED", "").lower() in ("true", "1")
+
+
 @dataclass(frozen=True)
 class PerfTestConfig:
     """Centralized configuration for performance tests.
 
     All defaults can be overridden via environment variables.
+
+    When ``SOAK_CONDENSED=true``, soak intervals are compressed so a full
+    upload/query/metrics cycle completes in ~15 minutes instead of hours.
+    This exercises the same code paths as a real soak run.
     """
     soak_duration_hours: float = field(
-        default_factory=lambda: float(os.environ.get("SOAK_DURATION_HOURS", "1"))
+        default_factory=lambda: float(os.environ.get(
+            "SOAK_DURATION_HOURS", "0.25" if _SOAK_CONDENSED else "1"
+        ))
     )
     soak_upload_interval_minutes: int = field(
-        default_factory=lambda: int(os.environ.get("SOAK_UPLOAD_INTERVAL_MINUTES", "15"))
+        default_factory=lambda: int(os.environ.get(
+            "SOAK_UPLOAD_INTERVAL_MINUTES", "1" if _SOAK_CONDENSED else "15"
+        ))
     )
     soak_query_interval_minutes: int = field(
-        default_factory=lambda: int(os.environ.get("SOAK_QUERY_INTERVAL_MINUTES", "5"))
+        default_factory=lambda: int(os.environ.get(
+            "SOAK_QUERY_INTERVAL_MINUTES", "1" if _SOAK_CONDENSED else "5"
+        ))
     )
     soak_metrics_interval_seconds: int = field(
-        default_factory=lambda: int(os.environ.get("SOAK_METRICS_INTERVAL_SECONDS", "60"))
+        default_factory=lambda: int(os.environ.get(
+            "SOAK_METRICS_INTERVAL_SECONDS", "15" if _SOAK_CONDENSED else "60"
+        ))
     )
     ing_high_freq_duration_minutes: int = field(
         default_factory=lambda: int(os.environ.get("PERF_ING_005_DURATION_MINUTES", "15"))

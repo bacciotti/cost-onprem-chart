@@ -90,12 +90,34 @@ Listener CPU is automatically boosted to node max for perf runs.
 validates the daily processing window spec and will run for the full duration
 on medium+ profiles. It is not gated by `SOAK_TESTS`.
 
+#### Soak Tests
+
+Soak tests are opt-in (long-running stability validation). Use `SOAK_CONDENSED=true`
+for a ~15-minute validation run that exercises all code paths at compressed intervals.
+
+```bash
+# Condensed soak (~15 min) — validate test logic quickly
+SOAK_TESTS=true SOAK_CONDENSED=true \
+  ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
+
+# 1-hour soak (default)
+SOAK_TESTS=true \
+  ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
+
+# 7-day soak
+SOAK_TESTS=true SOAK_DURATION_HOURS=168 \
+  ./scripts/deploy-test-cost-onprem.sh --perf-only --perf-suite soak --listener-cpu none
+```
+
 #### Key Environment Variables
 
 ```bash
 PERF_PROFILE=medium       # Profile to use (default: baseline)
 PERF_SUITE=all            # Suite(s) to run (default: all)
 LISTENER_CPU_LIMIT=max    # Listener CPU boost (default: max for perf runs)
+SOAK_TESTS=true           # Enable soak tests (opt-in)
+SOAK_CONDENSED=true       # Compress soak intervals for rapid iteration
+SOAK_DURATION_HOURS=1     # Soak duration (default: 1h, or 0.25h if condensed)
 ```
 
 ## Output

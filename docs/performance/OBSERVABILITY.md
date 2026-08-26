@@ -31,9 +31,10 @@ Use `deploy-test-cost-onprem.sh` for full integration of deployment, metrics col
     --collect-metrics \
     --upload-metrics
 
-# With explicit S3 configuration
-S3_ENDPOINT="https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com" \
-S3_BUCKET="eco-bucket-perf-scale" \
+# With explicit S3 configuration (see "S3 Configuration" below for how to
+# set S3_ENDPOINT/S3_BUCKET)
+S3_ENDPOINT="${S3_ENDPOINT}" \
+S3_BUCKET="${S3_BUCKET}" \
 ./scripts/deploy-test-cost-onprem.sh \
     --deploy-observability \
     --skip-helm \
@@ -54,7 +55,7 @@ For collecting metrics independently of performance tests:
 TEST_RUN_ID=baseline-v0.2.20 ./scripts/observability/collect-metrics.sh --continuous 30
 
 # 3. Upload results to S3-compatible storage
-S3_BUCKET=perf-metrics S3_ENDPOINT=https://minio.example.com \
+S3_BUCKET=perf-metrics S3_ENDPOINT=https://s3.example.com \
   ./scripts/observability/collect-metrics.sh --upload
 ```
 
@@ -250,14 +251,17 @@ For S3-compatible storage (MinIO, Ceph RGW, etc.):
 #   │   └── report.html
 #   └── metadata.json
 
-# Red Hat Ecosystem QE MinIO (public / anonymous bucket — no credentials needed)
-export S3_ENDPOINT="https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com"
-export S3_BUCKET="eco-bucket-perf-scale"
+# This project's perf results are stored on an internal (Red Hat VPN-only),
+# S3-compatible endpoint. It's not published in this repo since the repo
+# itself is public — get the endpoint/bucket from your team, then set:
+export S3_ENDPOINT="<your-teams-s3-endpoint>"
+export S3_BUCKET="<your-teams-perf-bucket>"
 ./scripts/deploy-test-cost-onprem.sh --run-perf --collect-metrics --upload-metrics
 
-# The defaults (S3_NO_VERIFY_SSL=true, S3_NO_SIGN_REQUEST=true) are tuned
-# for the shared MinIO above: TLS verification is skipped (untrusted cert)
-# and requests are unsigned (public bucket, no credentials required).
+# The defaults (S3_NO_VERIFY_SSL=true, S3_NO_SIGN_REQUEST=true) assume a
+# setup like the one above: TLS verification skipped (untrusted cert) and
+# requests unsigned (public/anonymous bucket, no credentials required).
+# Override them below if your S3 backend differs.
 
 # Note: S3_BUCKET is intentionally not defaulted to prevent accidental uploads
 # during local development. All outputs are saved locally; S3 upload only

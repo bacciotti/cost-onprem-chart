@@ -10,6 +10,7 @@ In Cursor, type `@` followed by the prompt name to include it in your conversati
 - `@run-iqe-tests` - Run IQE integration tests
 - `@analyze-test-run` - Analyze IQE test run logs for performance and failures
 - `@analyze-perf-run` - Analyze performance test results (downloaded or local)
+- `@run-soak-test` - Execute or monitor a soak test on a personal hypervisor
 - `@troubleshoot-tests` - Diagnose test failures
 - `@connect-cluster` - Set up cluster access
 - `@deploy-chart` - Deploy the Helm chart
@@ -27,6 +28,7 @@ In Cursor, type `@` followed by the prompt name to include it in your conversati
 | `run-iqe-tests.md` | Run IQE integration tests (containerized or local) |
 | `analyze-test-run.md` | Analyze IQE test run logs for performance and failures |
 | `analyze-perf-run.md` | Analyze performance test results with KPI assessment |
+| `run-soak-test.md` | Execute or monitor a soak test via SSH on a personal hypervisor |
 | `troubleshoot-tests.md` | Diagnose common test failures with specific commands |
 | `connect-cluster.md` | Set up OpenShift cluster access with credentials |
 | `deploy-chart.md` | Deploy the cost-onprem Helm chart |

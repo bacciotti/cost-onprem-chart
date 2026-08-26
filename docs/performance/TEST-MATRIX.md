@@ -203,11 +203,12 @@ Tests long-running stability and resource trends.
 
 ## Quick Reference: Flags → Actions
 
-Example command:
+Example command (see `docs/performance/OBSERVABILITY.md` for how to set
+`S3_BUCKET`/`S3_ENDPOINT`):
 ```bash
-S3_BUCKET="eco-bucket-perf-scale" \
+S3_BUCKET="<your-teams-perf-bucket>" \
 S3_PREFIX="cost-onprem-performance/" \
-S3_ENDPOINT="https://minio-s3-..." \
+S3_ENDPOINT="<your-teams-s3-endpoint>" \
 ./scripts/deploy-test-cost-onprem.sh \
   --skip-deploy --perf-only --perf-profile small --collect-metrics --upload-metrics
 ```

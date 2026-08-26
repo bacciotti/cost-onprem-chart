@@ -17,10 +17,11 @@ Collect performance metrics during test runs, export to JSON and self-contained 
 # 2. Run performance tests while collecting metrics
 TEST_RUN_ID=baseline-v0.2.20 ./collect-metrics.sh --continuous 30
 
-# 3. Upload results to S3 (Red Hat Ecosystem QE MinIO)
+# 3. Upload results to S3 (see ../../docs/performance/OBSERVABILITY.md for
+# how to set S3_ENDPOINT/S3_BUCKET)
 # S3_BUCKET is intentionally not defaulted to prevent accidental uploads
-S3_ENDPOINT="https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com" \
-S3_BUCKET="eco-bucket-perf-scale" \
+S3_ENDPOINT="<your-teams-s3-endpoint>" \
+S3_BUCKET="<your-teams-perf-bucket>" \
 ./collect-metrics.sh --upload
 ```
 
@@ -116,8 +117,8 @@ python3 scripts/observability/generate-perf-summary.py \
   --run-dir tests/perf-runs/<run-id>
 
 # Also update the S3 index
-S3_ENDPOINT=https://minio-s3-... \
-S3_BUCKET=eco-bucket-perf-scale \
+S3_ENDPOINT="<your-teams-s3-endpoint>" \
+S3_BUCKET="<your-teams-perf-bucket>" \
 python3 scripts/observability/generate-perf-summary.py \
   --run-dir tests/perf-runs/<run-id> \
   --update-index

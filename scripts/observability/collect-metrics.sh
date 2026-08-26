@@ -21,10 +21,10 @@
 #   S3_BUCKET            - S3 bucket for uploads (required for --upload)
 #   S3_PREFIX            - S3 key prefix (default: cost-onprem-performance/)
 #   S3_ENDPOINT          - S3 endpoint URL (for non-AWS S3-compatible storage)
-#   S3_NO_VERIFY_SSL     - Skip TLS verification (default: true — MinIO uses untrusted certs)
+#   S3_NO_VERIFY_SSL     - Skip TLS verification (default: true — internal S3 endpoints often use untrusted certs)
 #   S3_NO_SIGN_REQUEST   - Use anonymous access  (default: true — bucket is public, no creds)
 #
-# Note: The perf-results bucket (eco-bucket-perf-scale) is public/anonymous.
+# Note: The perf-results bucket is typically public/anonymous.
 # No AWS credentials are needed. S3 variables are intentionally not defaulted
 # to prevent accidental uploads during local development. Set S3_BUCKET
 # explicitly to enable uploads.
@@ -39,8 +39,8 @@
 #   # Continuous collection during test run
 #   TEST_RUN_ID=perf-baseline-001 ./collect-metrics.sh --continuous 60
 #
-#   # Upload to S3-compatible storage (MinIO, Ceph, etc.)
-#   S3_BUCKET=perf-metrics S3_ENDPOINT=https://minio.example.com ./collect-metrics.sh --upload
+#   # Upload to S3-compatible storage
+#   S3_BUCKET=perf-metrics S3_ENDPOINT=https://s3.example.com ./collect-metrics.sh --upload
 
 set -euo pipefail
 

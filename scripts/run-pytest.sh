@@ -169,6 +169,24 @@ check_prerequisites() {
     python_version=$("$PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
     log_info "Using Python $python_version"
 
+    # Some test files use PEP 604 union-type syntax (e.g. `dict | None`) in
+    # function signatures, which raises a TypeError at collection time on
+    # Python < 3.10. Fail fast here with a clear message instead of letting
+    # pytest hit a cryptic "unsupported operand type(s) for |" deep into
+    # collection — this bites fresh hosts whose default `python3` is older
+    # than expected (e.g. RHEL8-based hosts default to 3.9).
+    if ! "$PYTHON" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)"; then
+        log_error "Python $python_version is too old — this test suite requires Python 3.10+"
+        log_error "Set PYTHON to a newer interpreter and re-run, e.g.: PYTHON=python3.12 ${0}"
+        local candidate
+        for candidate in python3.13 python3.12 python3.11 python3.10; do
+            if command -v "$candidate" &> /dev/null; then
+                log_error "Found on this host: $candidate ($(command -v "$candidate"))"
+            fi
+        done
+        exit 1
+    fi
+
     # Check if we're logged into OpenShift
     if ! command -v oc &> /dev/null; then
         log_error "oc CLI not found. Please install OpenShift CLI."

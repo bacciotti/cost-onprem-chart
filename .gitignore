@@ -51,4 +51,5 @@ tests/reports/traces/
 
 # Performance test run output (metrics, results, reports, generated HTML)
 tests/perf-runs/
+tests/soak-runs/
 perf-runs/

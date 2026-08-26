@@ -876,7 +876,11 @@ create_grafana_datasources() {
     else
         log_success "Obtained Prometheus bearer token for grafana-sa (valid 1 year)"
     fi
-    
+
+    if [[ -z "${S3_ENDPOINT:-}" ]]; then
+        log_warning "S3_ENDPOINT not set — S3 (Infinity) Grafana datasource will have an empty allowed host and won't work. Set S3_ENDPOINT to your team's perf-results S3 endpoint first if you need that datasource."
+    fi
+
     cat <<EOF | oc apply -f -
 apiVersion: v1
 kind: ConfigMap
@@ -908,7 +912,7 @@ data:
         secureJsonData:
           httpHeaderValue1: "Bearer ${prom_token}"
         editable: false
-      - name: MinIO (Infinity)
+      - name: S3 (Infinity)
         type: yesoreyeram-infinity-datasource
         access: proxy
         isDefault: false
@@ -916,7 +920,7 @@ data:
           auth_method: "basicAuth"
           tlsSkipVerify: true
           allowedHosts:
-            - "${S3_ENDPOINT:-https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com}"
+            - "${S3_ENDPOINT:-}"
         secureJsonData:
           basicAuthPassword: "${AWS_SECRET_ACCESS_KEY:-}"
         basicAuth: true

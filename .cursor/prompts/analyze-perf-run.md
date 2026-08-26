@@ -6,7 +6,7 @@ Analyze a performance test run to understand results, identify issues, and asses
 
 Provide one of:
 1. **Local run directory**: e.g., `tests/perf-runs/0-2-20-rc5-baseline-1779843259`
-2. **S3/MinIO URL**: e.g., `https://minio-s3-.../cost-onprem-performance/RUN_ID/`
+2. **S3 URL**: e.g., `https://<s3-endpoint>/cost-onprem-performance/RUN_ID/`
 3. **Session JSON file**: e.g., `session_20260527_005520.json`
 
 ## Quick Analysis Commands
@@ -191,12 +191,14 @@ For PR reviews with performance results:
 - [ ] **Duration**: Run completed in expected time?
 - [ ] **Error messages**: Any new error patterns?
 
-### 9. Download from S3/MinIO
+### 9. Download from S3
+
+Uses the same `S3_ENDPOINT`/`S3_BUCKET` you already have configured for
+publishing results (`collect-metrics.sh`/`soak-loop.sh`):
 
 ```bash
-# From MinIO console URL
-S3_BASE="https://minio-s3-ecosystem-qe-ai--pipeline.apps.gpc.ocp-hub.prod.psi.redhat.com"
-BUCKET="eco-bucket-perf-scale"
+S3_BASE="${S3_ENDPOINT}"
+BUCKET="${S3_BUCKET}"
 RUN_ID="0-2-20-rc5-baseline-1779843259"
 
 # Download perf-summary.json

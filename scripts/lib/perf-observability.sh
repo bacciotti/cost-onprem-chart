@@ -193,8 +193,8 @@ upload_perf_results_to_s3() {
             || log_warning "Could not generate perf-summary.json (non-fatal)"
     fi
 
-    # The perf-results bucket (eco-bucket-perf-scale) is public/anonymous and
-    # the MinIO ingress uses an untrusted cert.  Default to skip-verify and
+    # The perf-results bucket is typically public/anonymous and its
+    # endpoint uses an untrusted cert.  Default to skip-verify and
     # no-sign so uploads work without credentials or a custom CA bundle.
     # Override with S3_NO_VERIFY_SSL=false / S3_NO_SIGN_REQUEST=false for a
     # different S3 backend that requires TLS verification or signed requests.

@@ -117,6 +117,20 @@ to node max for perf runs.
 - `tests/suites/performance/profiles.py` — Data generation profiles
 - `tests/suites/performance/conftest.py` — Fixtures, cleanup tracker, cluster info
 
+### Soak Testing on a Personal Hypervisor
+
+**See `.cursor/prompts/run-soak-test.md` for the full workflow.** Soak runs
+(24h/7-day) exceed Jenkins job timeouts, so they run via `scripts/soak-loop.sh`
+over SSH on a lab hypervisor (e.g. `ocp-edge94`), daemonized with `nohup`
+(no `screen`/`tmux` on these hosts). Two things fresh agents reliably get
+wrong: (1) a quiet log / `0% CPU` pytest process is normal — SOAK-001 sleeps
+between periodic actions and doesn't print progress live, so check elapsed
+time vs. `SOAK_DURATION_HOURS` before assuming a hang; (2) always use
+`scripts/s3-upload.py` (not a raw `aws s3` command) to check checkpoints —
+the bucket is anonymous/public on a non-AWS S3 endpoint with an untrusted
+cert, and every perf suite (soak included) publishes under the shared
+`cost-onprem-performance/<run-id>/` prefix, never a suite-specific one.
+
 ## IMPORTANT: Do NOT tail logs automatically
 
 **NEVER run `kubectl logs --follow` or `tail -f` or any log-tailing command unless explicitly asked by the user.** These commands block and waste time. Instead:

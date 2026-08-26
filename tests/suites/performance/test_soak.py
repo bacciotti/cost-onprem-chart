@@ -17,19 +17,21 @@ Test IDs:
 
 Usage:
     # Run 1-hour soak test (default)
-    pytest -m "performance and soak" --soak-duration=3600
-    
+    SOAK_TESTS=true pytest -m "performance and soak"
+
+    # Condensed mode (~15 min) — same code paths, compressed intervals
+    SOAK_TESTS=true SOAK_CONDENSED=true pytest -m "performance and soak"
+
     # Run 7-day soak test
-    SOAK_DURATION_HOURS=168 pytest -m "performance and soak"
-    
-    # Quick validation (15 minutes)
-    SOAK_DURATION_HOURS=0.25 pytest -m "performance and soak"
+    SOAK_TESTS=true SOAK_DURATION_HOURS=168 pytest -m "performance and soak"
 
 Environment Variables:
-    SOAK_DURATION_HOURS: Test duration in hours (default: 1)
-    SOAK_UPLOAD_INTERVAL_MINUTES: Interval between uploads (default: 15)
-    SOAK_QUERY_INTERVAL_MINUTES: Interval between API queries (default: 5)
-    SOAK_METRICS_INTERVAL_SECONDS: Metrics collection interval (default: 60)
+    SOAK_TESTS: Set to "true" to enable soak tests (opt-in)
+    SOAK_CONDENSED: Set to "true" for compressed intervals (~15 min cycle)
+    SOAK_DURATION_HOURS: Test duration in hours (default: 1, or 0.25 if condensed)
+    SOAK_UPLOAD_INTERVAL_MINUTES: Interval between uploads (default: 15, or 1 if condensed)
+    SOAK_QUERY_INTERVAL_MINUTES: Interval between API queries (default: 5, or 1 if condensed)
+    SOAK_METRICS_INTERVAL_SECONDS: Metrics collection interval (default: 60, or 15 if condensed)
 """
 
 import json
@@ -49,7 +51,6 @@ import requests
 
 from conftest import ClusterConfig, JWTToken
 from e2e_helpers import (
-    NISEConfig,
     cleanup_database_records,
     delete_source,
     ensure_nise_available,
@@ -74,11 +75,61 @@ from .helpers import PerfResultCollector, PerfTestConfig, save_perf_result
 from .profiles import ACTIVE_PROFILE as _ACTIVE_PROFILE
 from .tracker import PerfCleanupTracker
 
-# Soak tests are opt-in: must set SOAK_TESTS=true explicitly.
-# This decouples long-running stability tests from performance profile runs.
 _SOAK_ENABLED = os.environ.get("SOAK_TESTS", "").lower() in ("true", "1", "yes")
-# Compute once at import time so @pytest.mark.timeout() can reference it.
-_SOAK_DURATION_S = int(float(os.environ.get("SOAK_DURATION_HOURS", "1")) * 3600)
+_SOAK_CONDENSED = os.environ.get("SOAK_CONDENSED", "").lower() in ("true", "1")
+_SOAK_DURATION_S = int(float(os.environ.get(
+    "SOAK_DURATION_HOURS", "0.25" if _SOAK_CONDENSED else "1",
+)) * 3600)
+
+# Module-level state shared between SOAK-001 and SOAK-002/003/004.
+# SOAK-001 populates this after its run; subsequent tests analyze the
+# same collected samples rather than re-collecting independently.
+_soak_shared: Dict[str, Any] = {}
+
+# Number of consecutive iterations a pod must exceed the leak threshold
+# before SOAK-002 actually fails. soak-loop.sh runs each iteration as an
+# independent process, so a single hour's snapshot can't tell a one-time
+# step-change (e.g. JVM heap growth during warm-up, which plateaus) apart
+# from a genuine sustained leak. Requiring persistence across iterations
+# filters out one-off blips while still catching real leaks (just one
+# iteration later). See docs/performance/performance-testing-plan.md.
+_SOAK_LEAK_CONSECUTIVE_ITERATIONS = int(
+    os.environ.get("SOAK_LEAK_CONSECUTIVE_ITERATIONS", "2")
+)
+
+
+def _soak_leak_state_path() -> Optional[Path]:
+    """Stable file location shared across soak-loop.sh iterations.
+
+    PERF_OUTPUT_DIR is set per-iteration to ``<run_dir>/iteration-N``; its
+    parent is the stable run directory shared by every iteration of a
+    soak-loop.sh run. Returns None when not running under the loop (e.g. a
+    single long continuous soak run), where cross-iteration persistence
+    doesn't apply and detection falls back to immediate (single-window)
+    evaluation.
+    """
+    perf_output_dir = os.environ.get("PERF_OUTPUT_DIR")
+    if not perf_output_dir:
+        return None
+    return Path(perf_output_dir).parent / ".soak_leak_state.json"
+
+
+def _load_soak_leak_state(path: Optional[Path]) -> Dict[str, int]:
+    if not path or not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_soak_leak_state(path: Optional[Path], state: Dict[str, int]) -> None:
+    if not path:
+        return
+    try:
+        path.write_text(json.dumps(state))
+    except OSError:
+        pass
 
 
 # =============================================================================
@@ -232,29 +283,17 @@ def collect_disk_usage(namespace: str) -> Dict[str, float]:
                     if used.isdigit():
                         disk["postgresql"] = float(used)
     
-    # Kafka disk usage
-    result = run_oc_command([
-        "exec", "-n", namespace, "kafka-cluster-kafka-0", "--",
-        "df", "-BG", "/var/lib/kafka/data-0"
-    ], check=False)
-    
-    if result.returncode == 0:
-        lines = result.stdout.strip().split("\n")
-        if len(lines) > 1:
-            parts = lines[1].split()
-            if len(parts) >= 3:
-                used = parts[2].replace("G", "")
-                if used.isdigit():
-                    disk["kafka"] = float(used)
-    
-    # MinIO/S3 disk usage
-    minio_pod = get_pod_by_label(namespace, "app.kubernetes.io/name=minio")
-    if minio_pod:
+    # Kafka disk usage — use the same broker lookup as collect_queue_depths
+    from .kafka_helpers import get_kafka_broker_pod, get_kafka_namespace
+
+    kafka_namespace = get_kafka_namespace()
+    kafka_pod = get_kafka_broker_pod(kafka_namespace)
+    if kafka_pod:
         result = run_oc_command([
-            "exec", "-n", namespace, minio_pod, "--",
-            "df", "-BG", "/data"
+            "exec", "-n", kafka_namespace, kafka_pod, "--",
+            "df", "-BG", "/var/lib/kafka/data-0"
         ], check=False)
-        
+
         if result.returncode == 0:
             lines = result.stdout.strip().split("\n")
             if len(lines) > 1:
@@ -262,8 +301,43 @@ def collect_disk_usage(namespace: str) -> Dict[str, float]:
                 if len(parts) >= 3:
                     used = parts[2].replace("G", "")
                     if used.isdigit():
-                        disk["minio"] = float(used)
-    
+                        disk["kafka"] = float(used)
+
+    # ODF/NooBaa PVC usage — ODF environments don't have a MinIO pod.
+    # Query PVC capacity/usage for the noobaa-default-backing-store PVC instead.
+    # Falls back to MinIO pod lookup for non-ODF environments.
+    noobaa_pod = get_pod_by_label("openshift-storage", "app=noobaa-core")
+    if noobaa_pod:
+        result = run_oc_command([
+            "exec", "-n", "openshift-storage", noobaa_pod, "--",
+            "df", "-BG", "/data"
+        ], check=False)
+
+        if result.returncode == 0:
+            lines = result.stdout.strip().split("\n")
+            if len(lines) > 1:
+                parts = lines[1].split()
+                if len(parts) >= 3:
+                    used = parts[2].replace("G", "")
+                    if used.isdigit():
+                        disk["object_storage"] = float(used)
+    else:
+        minio_pod = get_pod_by_label(namespace, "app.kubernetes.io/name=minio")
+        if minio_pod:
+            result = run_oc_command([
+                "exec", "-n", namespace, minio_pod, "--",
+                "df", "-BG", "/data"
+            ], check=False)
+
+            if result.returncode == 0:
+                lines = result.stdout.strip().split("\n")
+                if len(lines) > 1:
+                    parts = lines[1].split()
+                    if len(parts) >= 3:
+                        used = parts[2].replace("G", "")
+                        if used.isdigit():
+                            disk["minio"] = float(used)
+
     return disk
 
 
@@ -283,12 +357,10 @@ def collect_queue_depths(namespace: str) -> Dict[str, int]:
         queues[f"celery/{q}"] = depth
 
     # Kafka consumer lag (soak-specific — not covered by get_celery_queue_depths)
-    kafka_namespace = os.environ.get("KAFKA_NAMESPACE", "kafka")
-    helm_release = os.environ.get("HELM_RELEASE_NAME", "cost-onprem")
+    from .kafka_helpers import get_kafka_broker_pod, get_kafka_namespace
 
-    kafka_pod = get_pod_by_label(kafka_namespace, f"app.kubernetes.io/name={helm_release}-kafka")
-    if not kafka_pod:
-        kafka_pod = get_pod_by_label(kafka_namespace, "strimzi.io/kind=Kafka")
+    kafka_namespace = get_kafka_namespace()
+    kafka_pod = get_kafka_broker_pod(kafka_namespace)
 
     if kafka_pod:
         result = run_oc_command([
@@ -349,6 +421,13 @@ def metrics_collector_worker(
         state.stop_event.wait(interval_seconds)
 
 
+def _refresh_token(keycloak_cfg) -> str:
+    """Obtain a fresh JWT token string from Keycloak."""
+    from conftest import obtain_jwt_token
+    token = obtain_jwt_token(keycloak_cfg)
+    return token.access_token
+
+
 def upload_worker(
     namespace: str,
     gateway_url: str,
@@ -358,39 +437,44 @@ def upload_worker(
     state: SoakTestState,
     interval_seconds: float,
     db_pod: Optional[str] = None,
+    keycloak_config=None,
 ):
     """Background worker that performs periodic uploads with processing verification.
 
     After every 3rd successful upload, verifies that data has been ingested by
     checking summary tables. This catches silent data drops without adding
     excessive overhead on every upload cycle.
+
+    Token is refreshed automatically on 401 responses (Keycloak tokens expire
+    after ~5 minutes).
     """
     ensure_nise_available()
-    
+
+    current_token = jwt_token
     upload_count = 0
     uploads_since_verify = 0
     VERIFY_EVERY_N = 3
-    
+
+    session = requests.Session()
+    session.verify = False
+
     while not state.stop_event.is_set():
         try:
-            # Generate 1 day of data
             end_date = datetime.now(timezone.utc)
             start_date = end_date - timedelta(days=1)
-            
+
             with tempfile.TemporaryDirectory() as temp_dir:
                 nise_result = generate_nise_data(
-                    NISEConfig(
-                        start_date=start_date,
-                        end_date=end_date,
-                        cluster_id=cluster_id,
-                        output_dir=temp_dir,
-                    )
+                    cluster_id=cluster_id,
+                    start_date=start_date,
+                    end_date=end_date,
+                    output_dir=temp_dir,
                 )
-                
-                if nise_result.get("success"):
+
+                if nise_result:
                     pod_usage_files = nise_result.get("pod_usage_files", [])
                     ros_usage_files = nise_result.get("ros_usage_files", [])
-                    
+
                     if pod_usage_files:
                         tar_path = create_upload_package_from_files(
                             pod_usage_files,
@@ -399,43 +483,62 @@ def upload_worker(
                             start_date=start_date,
                             end_date=end_date,
                         )
-                        
-                        if upload_with_retry(
-                            upload_url,
-                            tar_path,
-                            jwt_token,
-                            "application/vnd.redhat.hccm.filename+tgz",
-                            max_retries=3,
-                        ):
-                            state.increment_uploads(success=True)
-                            upload_count += 1
-                            uploads_since_verify += 1
-                            
-                            # Periodically verify processing
-                            if db_pod and uploads_since_verify >= VERIFY_EVERY_N:
-                                uploads_since_verify = 0
-                                try:
-                                    schema = wait_for_summary_tables(
-                                        namespace, db_pod, cluster_id,
-                                        timeout=120, interval=30,
-                                    )
-                                    if not schema:
-                                        state.add_error(
-                                            f"Processing verification failed after upload {upload_count}: "
-                                            "summary tables not populated"
-                                        )
-                                except Exception as ve:
-                                    state.add_error(f"Processing verification error: {ve}")
-                        else:
+
+                        auth_header = {"Authorization": f"Bearer {current_token}"}
+                        try:
+                            response = upload_with_retry(
+                                session, upload_url, tar_path, auth_header,
+                                max_retries=2, timeout=120,
+                            )
+                            if response.status_code == 401 and keycloak_config:
+                                current_token = _refresh_token(keycloak_config)
+                                print("[upload_worker] Refreshed JWT token (401)")
+                                auth_header = {"Authorization": f"Bearer {current_token}"}
+                                # Keycloak tokens expire after ~5 min while uploads happen
+                                # every 15 min, so nearly every upload takes this path. A single
+                                # attempt here (previously max_retries=1) had zero margin for
+                                # a transient RemoteDisconnected and permanently failed the
+                                # upload, tripping SOAK-001's zero-tolerance assertion on long
+                                # runs. Give it the same retry budget as the primary attempt.
+                                response = upload_with_retry(
+                                    session, upload_url, tar_path, auth_header,
+                                    max_retries=2, timeout=120,
+                                )
+
+                            if response.status_code in (200, 201, 202):
+                                state.increment_uploads(success=True)
+                                upload_count += 1
+                                uploads_since_verify += 1
+                            else:
+                                state.increment_uploads(success=False)
+                                state.add_error(
+                                    f"Upload {upload_count + 1} returned {response.status_code}"
+                                )
+                        except RuntimeError as ue:
                             state.increment_uploads(success=False)
-                            state.add_error(f"Upload {upload_count + 1} failed")
+                            state.add_error(f"Upload {upload_count + 1} failed: {ue}")
+
+                        if db_pod and uploads_since_verify >= VERIFY_EVERY_N:
+                            uploads_since_verify = 0
+                            try:
+                                schema = wait_for_summary_tables(
+                                    namespace, db_pod, cluster_id,
+                                    timeout=120, interval=30,
+                                )
+                                if not schema:
+                                    state.add_error(
+                                        f"Processing verification failed after upload {upload_count}: "
+                                        "summary tables not populated"
+                                    )
+                            except Exception as ve:
+                                state.add_error(f"Processing verification error: {ve}")
                 else:
                     state.increment_uploads(success=False)
                     state.add_error(f"NISE generation failed for upload {upload_count + 1}")
         except Exception as e:
             state.increment_uploads(success=False)
             state.add_error(f"Upload worker error: {e}")
-        
+
         state.stop_event.wait(interval_seconds)
 
 
@@ -444,40 +547,62 @@ def query_worker(
     jwt_token: str,
     state: SoakTestState,
     interval_seconds: float,
+    keycloak_config=None,
 ):
-    """Background worker that performs periodic API queries."""
-    # gateway_url already includes /api — endpoints are relative to that base
+    """Background worker that performs periodic API queries.
+
+    Token is refreshed automatically on 401 Unauthorized responses.
+    """
     endpoints = [
         "/cost-management/v1/sources/",
         "/cost-management/v1/reports/openshift/costs/?filter[time_scope_units]=month&filter[time_scope_value]=-1",
         "/cost-management/v1/reports/openshift/memory/?filter[time_scope_units]=month&filter[time_scope_value]=-1",
         "/cost-management/v1/recommendations/openshift",
     ]
-    
+
+    current_token = jwt_token
     query_idx = 0
     while not state.stop_event.is_set():
         try:
             endpoint = endpoints[query_idx % len(endpoints)]
             url = f"{gateway_url}{endpoint}"
-            
+
             response = requests.get(
                 url,
-                headers={"Authorization": f"Bearer {jwt_token}"},
+                headers={"Authorization": f"Bearer {current_token}"},
                 timeout=30,
                 verify=False,
             )
-            
+
+            if response.status_code == 401 and keycloak_config:
+                try:
+                    current_token = _refresh_token(keycloak_config)
+                    print(f"[query_worker] Refreshed JWT token (401 on {endpoint})")
+                    response = requests.get(
+                        url,
+                        headers={"Authorization": f"Bearer {current_token}"},
+                        timeout=30,
+                        verify=False,
+                    )
+                except Exception as refresh_err:
+                    # Keep the stale token and retry next iteration rather than
+                    # crashing the worker, but surface the failure — silently
+                    # swallowing this would otherwise hide a permanent 401 loop
+                    # (e.g. Keycloak down/unreachable) for the rest of the run.
+                    print(f"[query_worker] Token refresh failed: {refresh_err}")
+                    state.add_error(f"Token refresh failed: {refresh_err}")
+
             if response.status_code in [200, 404]:
                 state.increment_queries(success=True)
             else:
                 state.increment_queries(success=False)
                 state.add_error(f"Query failed: {endpoint} returned {response.status_code}")
-            
+
             query_idx += 1
         except Exception as e:
             state.increment_queries(success=False)
             state.add_error(f"Query worker error: {e}")
-        
+
         state.stop_event.wait(interval_seconds)
 
 
@@ -612,6 +737,67 @@ def analyze_queue_health(samples: List[MetricSample]) -> Dict[str, Any]:
     return analysis
 
 
+def _get_restart_counts(namespace: str) -> Dict[str, int]:
+    """Return {pod_name: restart_count} for all pods in the namespace."""
+    result = run_oc_command([
+        "get", "pods", "-n", namespace,
+        "-o", "jsonpath={range .items[*]}{.metadata.name}:{.status.containerStatuses[0].restartCount}{\"\\n\"}{end}"
+    ], check=False)
+    counts: Dict[str, int] = {}
+    if result.returncode == 0:
+        for line in result.stdout.strip().split("\n"):
+            if ":" in line:
+                pod, count = line.split(":", 1)
+                if count.isdigit():
+                    counts[pod] = int(count)
+    return counts
+
+
+def _get_soak_samples_or_standalone(
+    namespace: str, perf_config: PerfTestConfig, test_id: str
+) -> List["MetricSample"]:
+    """Return SOAK-001's shared samples, or fall back to a short standalone
+    collection when no test in this process already populated ``_soak_shared``.
+
+    A missing SOAK-001 fallback almost always means either a deliberate
+    standalone invocation (fine — proceed with a short smoke check) or tests
+    ran out of order within the same process, e.g. under pytest-randomly or
+    pytest-xdist (not fine — silently degrading to a 2-minute sample would
+    mask that and produce a hollow pass/fail signal for a run that's supposed
+    to be a real multi-hour/multi-day soak). Distinguish the two by duration:
+    a non-condensed run with a substantial configured duration is expected to
+    have real SOAK-001 data, so treat its absence as an ordering error.
+    """
+    if "samples" in _soak_shared and len(_soak_shared["samples"]) >= 2:
+        samples = _soak_shared["samples"]
+        print(f"\n=== {test_id}: Analyzing {len(samples)} samples from SOAK-001 ===")
+        return samples
+
+    if not _SOAK_CONDENSED and _SOAK_DURATION_S > 300:
+        pytest.skip(
+            f"{test_id}: no SOAK-001 data available for a non-condensed "
+            f"{_SOAK_DURATION_S}s soak run. This usually means tests ran out "
+            "of order within this process (e.g. pytest-randomly/pytest-xdist) "
+            "rather than a deliberate standalone run — run the full "
+            "TestSoakStability class in its normal order, or set "
+            "SOAK_CONDENSED=true to opt into standalone smoke-check mode."
+        )
+
+    print(
+        f"\n=== {test_id}: No SOAK-001 data — collecting standalone (2 min, "
+        "smoke check only; too short for a meaningful trend signal) ==="
+    )
+    interval = perf_config.soak_metrics_interval_seconds
+    samples = []
+    start_time = time.time()
+    standalone_duration = 120
+    while time.time() - start_time < standalone_duration:
+        samples.append(collect_metrics(namespace, start_time))
+        time.sleep(interval)
+    print(f"  Collected {len(samples)} standalone samples")
+    return samples
+
+
 # =============================================================================
 # Test Classes
 # =============================================================================
@@ -652,6 +838,7 @@ class TestSoakStability:
         ingress_pod,
         koku_api_url,
         jwt_token: JWTToken,
+        keycloak_config,
         rh_identity_header: str,
     ):
         """PERF-SOAK-001: Continuous operation stability test.
@@ -688,7 +875,11 @@ class TestSoakStability:
         
         # Initialize state
         state = SoakTestState()
-        
+
+        # Capture baseline restart counts so we only flag restarts that happen
+        # during the soak window (not pre-existing ones from prior runs).
+        baseline_restarts = _get_restart_counts(cluster_config.namespace)
+
         # Get DB pod for processing verification
         db_pod = get_pod_by_label(cluster_config.namespace, "app.kubernetes.io/component=database")
         
@@ -715,11 +906,12 @@ class TestSoakStability:
                 state,
                 _soak_upload_interval_seconds(perf_config),
                 db_pod,
+                keycloak_config,
             ),
         )
         upload_thread.start()
         threads.append(upload_thread)
-        
+
         # Query worker
         query_thread = threading.Thread(
             target=query_worker,
@@ -728,56 +920,58 @@ class TestSoakStability:
                 jwt_token.access_token,
                 state,
                 _soak_query_interval_seconds(perf_config),
+                keycloak_config,
             ),
         )
         query_thread.start()
         threads.append(query_thread)
         
-        print(f"\n=== PERF-SOAK-001: Starting {perf_config.soak_duration_hours}h soak test ===")
-        print(f"  Upload interval: {perf_config.soak_upload_interval_minutes} minutes")
-        print(f"  Query interval: {perf_config.soak_query_interval_minutes} minutes")
-        print(f"  Metrics interval: {perf_config.soak_metrics_interval_seconds} seconds")
+        mode_label = "CONDENSED" if _SOAK_CONDENSED else "STANDARD"
+        print(f"\n=== PERF-SOAK-001: Starting {perf_config.soak_duration_hours}h soak test ({mode_label}) ===")
+        print(f"  Upload interval: {perf_config.soak_upload_interval_minutes} min")
+        print(f"  Query interval: {perf_config.soak_query_interval_minutes} min")
+        print(f"  Metrics interval: {perf_config.soak_metrics_interval_seconds} sec")
         
         try:
-            # Run for configured duration
             start = time.time()
             soak_duration_s = _soak_duration_seconds(perf_config)
+            report_interval = 60 if _SOAK_CONDENSED else 300
+            last_report = 0.0
             while time.time() - start < soak_duration_s:
                 elapsed = time.time() - start
                 remaining = soak_duration_s - elapsed
-                
-                # Progress update every 5 minutes
-                if int(elapsed) % 300 == 0:
+
+                if elapsed - last_report >= report_interval:
+                    last_report = elapsed
                     print(f"  Progress: {elapsed/3600:.1f}h elapsed, {remaining/3600:.1f}h remaining")
                     print(f"    Uploads: {state.uploads_completed} ok, {state.uploads_failed} failed")
                     print(f"    Queries: {state.queries_completed} ok, {state.queries_failed} failed")
                     print(f"    Samples: {len(state.samples)}")
-                
-                time.sleep(60)  # Check every minute
+
+                time.sleep(min(30, report_interval))
         finally:
             # Stop workers
             state.stop_event.set()
             for t in threads:
                 t.join(timeout=30)
         
+        # Share collected samples with SOAK-002/003/004
+        _soak_shared["samples"] = state.samples
+        _soak_shared["state"] = state
+
         # Analyze results
         memory_analysis = analyze_memory_trend(state.samples)
         disk_analysis = analyze_disk_trend(state.samples)
         queue_analysis = analyze_queue_health(state.samples)
-        
-        # Check for OOM (pod restarts)
-        result = run_oc_command([
-            "get", "pods", "-n", cluster_config.namespace,
-            "-o", "jsonpath={range .items[*]}{.metadata.name}:{.status.containerStatuses[0].restartCount}{\"\\n\"}{end}"
-        ], check=False)
-        
+
+        # Check for restarts that occurred *during* the soak (delta from baseline)
+        current_restarts = _get_restart_counts(cluster_config.namespace)
         restarts = {}
-        if result.returncode == 0:
-            for line in result.stdout.strip().split("\n"):
-                if ":" in line:
-                    pod, count = line.split(":", 1)
-                    if count.isdigit() and int(count) > 0:
-                        restarts[pod] = int(count)
+        for pod, count in current_restarts.items():
+            baseline = baseline_restarts.get(pod, 0)
+            delta = count - baseline
+            if delta > 0:
+                restarts[pod] = delta
         
         # Build result
         perf_result.metrics = {
@@ -817,7 +1011,7 @@ class TestSoakStability:
         not _SOAK_ENABLED,
         reason="SOAK-002 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
-    @pytest.mark.timeout(_SOAK_DURATION_S + 300)
+    @pytest.mark.timeout(600)
     def test_perf_soak_002_memory_leak_detection(
         self,
         cluster_config,
@@ -826,79 +1020,106 @@ class TestSoakStability:
         perf_config: PerfTestConfig,
     ):
         """PERF-SOAK-002: Memory leak detection.
-        
-        Monitors memory growth over time. Requires SOAK-001 to have run first
-        or can run standalone for shorter periods.
-        
-        Success criteria: < 5% memory growth per day
+
+        Analyzes SOAK-001's collected samples for memory growth patterns.
+        If SOAK-001 hasn't run, does a short standalone collection (2 min).
+
+        Success criteria: < 5% memory growth per day (extrapolated)
         """
-        # Collect samples for the configured duration (or minimum 60 seconds for validation)
-        duration = max(_soak_duration_seconds(perf_config), 60)
-        interval = perf_config.soak_metrics_interval_seconds
-        
-        samples = []
-        start_time = time.time()
-        
-        print(f"\n=== PERF-SOAK-002: Collecting memory samples for {duration/60:.0f} minutes ===")
-        
-        while time.time() - start_time < duration:
-            sample = collect_metrics(cluster_config.namespace, start_time)
-            samples.append(sample)
-            
-            elapsed = time.time() - start_time
-            if int(elapsed) % 300 == 0:
-                print(f"  Progress: {elapsed/60:.0f} minutes, {len(samples)} samples")
-            
-            time.sleep(interval)
-        
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-002"
+        )
+
+        actual_duration_s = samples[-1].elapsed_seconds if samples else 0
+
         # Analyze memory trend
         memory_analysis = analyze_memory_trend(samples)
-        
-        # Calculate overall memory health
+
         leak_detected = False
-        leak_pods = []
-        
+
+        # For short runs (< 1h), extrapolation to daily growth is unreliable.
+        # Normal JVM/Python GC and cache warm-up cause memory fluctuations that
+        # extrapolate to hundreds of percent daily growth when measured over
+        # 15 minutes. Require substantial absolute growth to flag a leak.
+        #
+        # This floor also applies to normal (>= 1h) windows: a 1-4MB swing on
+        # a low-memory pod (e.g. 36MB -> 37MB) extrapolates to 60%+/day when
+        # projected linearly from a single hour, but it's pure measurement
+        # noise, not a leak. See COST-7634 soak validation findings.
+        duration_hours = actual_duration_s / 3600 if actual_duration_s > 0 else 0
+        daily_threshold = 5.0 if duration_hours >= 1.0 else 50.0
+        min_absolute_growth_mb = 50.0
+
+        candidates = []
         for pod, stats in memory_analysis.items():
             if isinstance(stats, dict) and "growth_pct" in stats:
-                # Extrapolate to daily growth
-                duration_hours = samples[-1].elapsed_seconds / 3600 if samples else 0
                 if duration_hours > 0:
                     daily_growth_pct = stats["growth_pct"] * (24 / duration_hours)
-                    if daily_growth_pct > 5:
-                        leak_detected = True
-                        leak_pods.append({
+                    absolute_growth = stats["final_mb"] - stats["initial_mb"]
+                    if daily_growth_pct > daily_threshold and absolute_growth > min_absolute_growth_mb:
+                        candidates.append({
                             "pod": pod,
                             "daily_growth_pct": daily_growth_pct,
                             "initial_mb": stats["initial_mb"],
                             "final_mb": stats["final_mb"],
+                            "absolute_growth_mb": absolute_growth,
                         })
-        
+
+        # Require growth to persist across consecutive iterations before
+        # failing. A single hour's step-change (e.g. one-time JVM heap growth
+        # during warm-up, which then plateaus) looks identical to the start
+        # of a leak when viewed through one 1-hour window in isolation.
+        state_path = _soak_leak_state_path()
+        leak_state = _load_soak_leak_state(state_path)
+        candidate_pods = {c["pod"] for c in candidates}
+        for pod in list(leak_state.keys()):
+            if pod not in candidate_pods:
+                leak_state[pod] = 0
+        for pod in candidate_pods:
+            leak_state[pod] = leak_state.get(pod, 0) + 1
+        _save_soak_leak_state(state_path, leak_state)
+
+        if state_path is None:
+            # No loop context (standalone/continuous run) — nothing to wait
+            # for next iteration, so evaluate immediately.
+            leak_pods = candidates
+        else:
+            leak_pods = [
+                c for c in candidates
+                if leak_state.get(c["pod"], 0) >= _SOAK_LEAK_CONSECUTIVE_ITERATIONS
+            ]
+
+        leak_detected = bool(leak_pods)
+
         perf_result.metrics = {
-            "duration_seconds": duration,
+            "duration_seconds": actual_duration_s,
             "sample_count": len(samples),
             "memory_analysis": memory_analysis,
             "leak_detected": leak_detected,
             "leak_pods": leak_pods,
+            "leak_candidates": candidates,
         }
-        
+
         perf_result.passed = not leak_detected
         perf_collector.add_result(perf_result)
-        
+
         print(f"\n=== PERF-SOAK-002 Results ===")
-        print(f"  Duration: {duration/60:.0f} minutes")
+        print(f"  Duration: {actual_duration_s/60:.0f} minutes")
         print(f"  Samples: {len(samples)}")
         print(f"  Leak detected: {leak_detected}")
-        if leak_pods:
-            for p in leak_pods:
-                print(f"    - {p['pod']}: {p['daily_growth_pct']:.1f}% daily growth")
-        
+        if candidates:
+            for c in candidates:
+                confirmed = leak_state.get(c["pod"], 0) >= _SOAK_LEAK_CONSECUTIVE_ITERATIONS
+                marker = "CONFIRMED" if confirmed else f"watch ({leak_state.get(c['pod'], 0)}/{_SOAK_LEAK_CONSECUTIVE_ITERATIONS})"
+                print(f"    - {c['pod']}: {c['daily_growth_pct']:.1f}% daily growth [{marker}]")
+
         assert not leak_detected, f"Memory leak detected in pods: {[p['pod'] for p in leak_pods]}"
 
     @pytest.mark.skipif(
         not _SOAK_ENABLED,
         reason="SOAK-003 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
-    @pytest.mark.timeout(_SOAK_DURATION_S + 300)
+    @pytest.mark.timeout(600)
     def test_perf_soak_003_disk_usage_monitoring(
         self,
         cluster_config,
@@ -907,53 +1128,44 @@ class TestSoakStability:
         perf_config: PerfTestConfig,
     ):
         """PERF-SOAK-003: Disk usage monitoring.
-        
-        Monitors disk usage trends for PostgreSQL, Kafka, and MinIO.
-        
-        Success criteria: No disk exhaustion warnings
+
+        Analyzes SOAK-001's collected samples for disk growth patterns.
+        If SOAK-001 hasn't run, does a short standalone collection (2 min).
+
+        Success criteria: No disk exhaustion warnings (< 50 GB projected 7-day growth)
         """
-        # Collect samples for the configured duration (or minimum 60 seconds for validation)
-        duration = max(_soak_duration_seconds(perf_config), 60)
-        interval = perf_config.soak_metrics_interval_seconds
-        
-        samples = []
-        start_time = time.time()
-        
-        print(f"\n=== PERF-SOAK-003: Monitoring disk usage for {duration/60:.0f} minutes ===")
-        
-        while time.time() - start_time < duration:
-            sample = collect_metrics(cluster_config.namespace, start_time)
-            samples.append(sample)
-            time.sleep(interval)
-        
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-003"
+        )
+
+        actual_duration_s = samples[-1].elapsed_seconds if samples else 0
+
         # Analyze disk trend
         disk_analysis = analyze_disk_trend(samples)
-        
-        # Check for concerning growth rates
+
         warnings = []
         for component, stats in disk_analysis.items():
             if isinstance(stats, dict) and "growth_rate_gb_per_hour" in stats:
-                # Project to 7 days
                 projected_growth = stats["growth_rate_gb_per_hour"] * 24 * 7
-                if projected_growth > 50:  # > 50GB in 7 days
+                if projected_growth > 50:
                     warnings.append({
                         "component": component,
                         "current_gb": stats["final_gb"],
                         "projected_7day_growth_gb": projected_growth,
                     })
-        
+
         perf_result.metrics = {
-            "duration_seconds": duration,
+            "duration_seconds": actual_duration_s,
             "sample_count": len(samples),
             "disk_analysis": disk_analysis,
             "warnings": warnings,
         }
-        
+
         perf_result.passed = len(warnings) == 0
         perf_collector.add_result(perf_result)
-        
+
         print(f"\n=== PERF-SOAK-003 Results ===")
-        print(f"  Duration: {duration/60:.0f} minutes")
+        print(f"  Duration: {actual_duration_s/60:.0f} minutes")
         for component, stats in disk_analysis.items():
             if isinstance(stats, dict):
                 print(f"  {component}:")
@@ -969,7 +1181,7 @@ class TestSoakStability:
         not _SOAK_ENABLED,
         reason="SOAK-004 requires SOAK_TESTS=true — multi-hour stability tests are opt-in.",
     )
-    @pytest.mark.timeout(_SOAK_DURATION_S + 300)
+    @pytest.mark.timeout(600)
     def test_perf_soak_004_queue_health_monitoring(
         self,
         cluster_config,
@@ -978,33 +1190,24 @@ class TestSoakStability:
         perf_config: PerfTestConfig,
     ):
         """PERF-SOAK-004: Queue health monitoring.
-        
-        Monitors Celery and Kafka queue depths to detect starvation or backlog.
-        
+
+        Analyzes SOAK-001's collected samples for queue starvation or backlog.
+        If SOAK-001 hasn't run, does a short standalone collection (2 min).
+
         Success criteria: No sustained queue growth indicating processing backup
         """
-        # Collect samples for the configured duration (or minimum 60 seconds for validation)
-        duration = max(_soak_duration_seconds(perf_config), 60)
-        interval = perf_config.soak_metrics_interval_seconds
-        
-        samples = []
-        start_time = time.time()
-        
-        print(f"\n=== PERF-SOAK-004: Monitoring queue health for {duration/60:.0f} minutes ===")
-        
-        while time.time() - start_time < duration:
-            sample = collect_metrics(cluster_config.namespace, start_time)
-            samples.append(sample)
-            time.sleep(interval)
-        
+        samples = _get_soak_samples_or_standalone(
+            cluster_config.namespace, perf_config, "PERF-SOAK-004"
+        )
+
+        actual_duration_s = samples[-1].elapsed_seconds if samples else 0
+
         # Analyze queue health
         queue_analysis = analyze_queue_health(samples)
-        
-        # Check for concerning patterns
+
         concerns = []
         for queue, stats in queue_analysis.items():
             if isinstance(stats, dict):
-                # High sustained queue depth
                 if stats.get("avg_depth", 0) > 100:
                     concerns.append({
                         "queue": queue,
@@ -1012,26 +1215,25 @@ class TestSoakStability:
                         "avg_depth": stats["avg_depth"],
                         "peak_depth": stats["peak_depth"],
                     })
-                # Queue always has items (potential backup)
                 if stats.get("non_empty_pct", 0) > 90:
                     concerns.append({
                         "queue": queue,
                         "issue": "sustained_backlog",
                         "non_empty_pct": stats["non_empty_pct"],
                     })
-        
+
         perf_result.metrics = {
-            "duration_seconds": duration,
+            "duration_seconds": actual_duration_s,
             "sample_count": len(samples),
             "queue_analysis": queue_analysis,
             "concerns": concerns,
         }
-        
+
         perf_result.passed = len(concerns) == 0
         perf_collector.add_result(perf_result)
-        
+
         print(f"\n=== PERF-SOAK-004 Results ===")
-        print(f"  Duration: {duration/60:.0f} minutes")
+        print(f"  Duration: {actual_duration_s/60:.0f} minutes")
         for queue, stats in queue_analysis.items():
             if isinstance(stats, dict):
                 print(f"  {queue}:")

@@ -933,6 +933,62 @@ During medium-profile tests, Ceph reported `OSD_FULL` despite disks at 25-29% ac
 
 ---
 
+## Soak / Long-Running Stability Testing
+
+### PERF-FINDING-038: Transient S3 Upload Drops Fail Soak Iterations (No Retry)
+
+**Status**: Fixed
+**Severity**: Medium
+**Category**: Test harness robustness (not a product issue)
+
+**Tests**: `test_perf_soak_001_continuous_operation` (soak loop, `scripts/soak-loop.sh`)
+
+**Problem**:
+During the 72.6h soak run `soak-20260821-173101` (4h iterations, 18 total),
+4 iterations (5, 7, 12, 14) failed with the identical signature:
+
+```
+AssertionError: 1 uploads failed
+assert 1 == 0
+```
+
+The underlying error in every case was a single dropped S3 (NooBaa) upload
+connection:
+
+```
+Upload N failed: Upload failed after 1 attempts:
+('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))
+```
+
+Each affected iteration completed 15 of 16 uploads and all 48 queries
+successfully — one transient connection drop was enough to fail the
+iteration because the soak upload loop gives up after a single attempt
+(no retry/backoff).
+
+**Analysis**:
+- Failures were sparse and non-contiguous (iters 5, 7, 12, 14) — consistent
+  with intermittent connectivity, not a systematic regression.
+- All other soak tests passed in every iteration: memory leak detection
+  (002), disk usage (003), queue health (004).
+- Cluster health was stable throughout: 0 pods not ready, 2 total pod
+  restarts across 72.6h.
+
+**Validation**:
+The follow-up 24.2h run `soak-20260824-184917` (3h iterations, 8 total)
+passed 8/8 with **0 failed uploads across all 96 uploads** and 0 failed
+queries — the failure mode did not reproduce.
+
+**Caveat**: The passing run had a shorter exposure window (24h vs 72.6h),
+so the intermittent nature of the failure is not fully ruled out at longer
+durations.
+
+**Fix**: Add retry with backoff (e.g., 2–3 attempts) to the
+soak upload loop for transient errors (`RemoteDisconnected`,
+`Connection aborted`, timeouts) so a single dropped connection does not
+fail a multi-hour stability iteration.
+
+---
+
 ## Performance Baselines
 
 Validated throughput, processing times, API latencies, and concurrent upload
