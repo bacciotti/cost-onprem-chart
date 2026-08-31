@@ -507,9 +507,24 @@ insights-rbac uses Django's cache framework for internal query results.
 
 ### Flushing Caches
 
-> **Note:** The manual cache flush workflow below is a known UX gap. A dedicated script or Helm hook for automated cache invalidation is planned as a follow-up improvement. For most use cases, the TTL-based expiry (300s on the Koku side) is sufficient without manual intervention.
+After making permission changes that need immediate effect, run:
 
-After making permission changes that need immediate effect:
+```bash
+./scripts/flush-rbac-cache.sh <namespace>
+```
+
+For Helm releases that set `app.kubernetes.io/instance` to the release name:
+
+```bash
+./scripts/flush-rbac-cache.sh <namespace> --instance cost-onprem
+```
+
+Options: `--dry-run`, `--django-only`, `--valkey-only`. See `scripts/flush-rbac-cache.sh --help`.
+
+For most use cases, the TTL-based expiry (300s on the Koku side) is sufficient
+without manual intervention. Flush only when immediate effect is required.
+
+**Manual fallback** (if the script is unavailable):
 
 ```bash
 # 1. Flush insights-rbac Django cache
@@ -518,7 +533,7 @@ kubectl exec -it $RBAC_POD -n <namespace> -- \
   python manage.py shell -c "from django.core.cache import cache; cache.clear(); print('RBAC cache cleared')"
 
 # 2. Flush Koku's RBAC cache in Valkey
-VALKEY_POD=$(kubectl get pod -l app.kubernetes.io/component=valkey -n <namespace> -o jsonpath='{.items[0].metadata.name}')
+VALKEY_POD=$(kubectl get pod -l app.kubernetes.io/component=cache -n <namespace> -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -it $VALKEY_POD -n <namespace> -- valkey-cli FLUSHALL
 
 echo "Both caches flushed — permission changes are now active"
